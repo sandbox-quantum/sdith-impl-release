@@ -8,7 +8,7 @@
 #define PARAM_k 126   // code dimension
 #define PARAM_w 79    // hammimg weight
 #define PARAM_d 1     // twist
-#define PARAM_t 5     // number of challenge points per iteration
+#define PARAM_t 4     // number of challenge points per iteration
 #define PARAM_tau 19  // number of parallel repetitions
 #define PARAM_D   8   // hypercube dimension (2^D leaf parties)
 #define PARAM_seed_size 32
@@ -16,7 +16,7 @@
 #define PARAM_rho_size 16
 #define PARAM_commit_size 32
 #define PARAM_hash_size 32
-#define PARAM_fpoint_size 3
+#define PARAM_fpoint_size 4
 
 #ifdef CAT_3
 #define PARAM_m 352   // code length
