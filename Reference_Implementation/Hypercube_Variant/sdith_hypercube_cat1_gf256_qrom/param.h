@@ -11,7 +11,7 @@
 #define PARAM_t 4     // number of challenge points per iteration
 #define PARAM_tau 19  // number of parallel repetitions
 #define PARAM_D   8   // hypercube dimension (2^D leaf parties)
-#define PARAM_seed_size 32
+#define PARAM_seed_size 16
 #define PARAM_salt_size 16
 #define PARAM_rho_size 16
 #define PARAM_commit_size 32
@@ -26,7 +26,7 @@
 #define PARAM_t 3     // number of challenge points per iteration
 #define PARAM_tau 26  // number of parallel repetitions
 #define PARAM_D   8   // hypercube dimension (2^D leaf parties)
-#define PARAM_seed_size 32
+#define PARAM_seed_size 24
 #define PARAM_salt_size 16
 #define PARAM_rho_size 16
 #define PARAM_commit_size 24
