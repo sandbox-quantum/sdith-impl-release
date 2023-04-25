@@ -4,9 +4,12 @@
 
 #include "aes256ctr.h"
 #include "stdlib.h"
+#include "string.h"
 
 RNG_CTX *sdith_rng_create_rng_ctx(void const *const seed, void const *const nonce) {
-  return (RNG_CTX *)aes256ctr_init(seed, (uint8_t*)nonce);
+  uint8_t key[32] = {0};
+  memcpy(key, seed, PARAM_seed_size);
+  return (RNG_CTX *)aes256ctr_init(key, (uint8_t*)nonce);
 }
 
 void sdith_rng_free_rng_ctx(RNG_CTX *ctx) { aes256ctr_deinit(ctx); }
