@@ -1,44 +1,55 @@
-# This Makefile builds sdith_hypercube_<SEC_LEVEL>_<VARIANT>.
+# This Makefile builds sdith_hypercube_<SEC_LEVEL>_<FIELD>_<VARIANT>.
 # SEC_LEVEL: CAT_1|CAT_3|CAT_5
-# VARIANT: generic64|AVX2
+# FIELD: GF256|P251
+# VARIANT: ref|avx2
 
 .POSIX:
 
-VARIANT = AVX2
+VARIANT = avx2
+FIELD = GF256
 SEC_LEVEL = CAT_1
 
-ifeq ($(VARIANT), AVX2)
-	AVXFLAGS = -mavx2 -mpclmul -mgfni -mavx -maes
+HASH_PATH=sha3
+HASH_INCLUDE=-Isha3/avx2
+
+ifeq ($(VARIANT), avx2)
+	AVXFLAGS = -DAVX2 -mavx2 -mpclmul -mgfni -mavx -maes
+	HASH_MAKE_OPTIONS = PLATFORM=avx2
 else
 	AVXFLAGS =
+	HASH_MAKE_OPTIONS = PLATFORM=opt64
 endif
 CC = gcc
-CFLAGS = -W -Wall -O3 -fPIC -D${SEC_LEVEL}
+CFLAGS = -W -Wall -O3 -fPIC -DNDEBUG -D${SEC_LEVEL}
 
-XKCP_PATH = ../../../Library/XKCP
 KAT_MAIN_PATH = ../../../KAT/generator
 
-ifeq ($(VARIANT), AVX2)
-	GF256_SRC = gf2p24.c gf2p32.c gf256.c gf256-avx2-polytable-ct.c gf256-avx2.c gf256-avx2-gfni.c gf256-avx-pclmul.c
-	P251_SRC = p251.c p251p3.c p251p4.c p251-avx2-ct.c
-	AES_SRC = aes256ctr-avx.c
+ifeq ($(VARIANT), avx2)
+	GF256_SRC = gf256.c gf2p24.c gf2p32.c gf256-avx2-polytable-ct.c gf256-avx2.c gf256-avx2-gfni.c gf256-avx-pclmul.c
+	P251_SRC = p251.c p251p4.c p251-avx2-ct.c
 else
 	GF256_SRC = gf2p24.c gf2p32.c gf256.c
-	P251_SRC = p251.c p251p3.c p251p4.c
-	AES_SRC = aes256ctr-ref.c
+	P251_SRC = p251.c p251p4.c
 endif
+
+ifeq ($(FIELD), GF256)
+	FIELD_SRC = ${GF256_SRC}
+else
+	FIELD_SRC = ${P251_SRC}
+endif
+
 CRYPTO_SRC = hash-sha3.c rng.c treeprg.c
-SDITH_SRC = sdith.c sign.c
+SDITH_SRC = sdith.c precomputed.c sign.c
 KAT_MAIN_SRC = ${KAT_MAIN_PATH}/PQCgenKAT_sign.c ${KAT_MAIN_PATH}/rng.c
 
 all: sign
 
-libXKCP.a:
-	-cd ${XKCP_PATH} && ${MAKE} ${VARIANT}/libXKCP.a
+libhash:
+	$(HASH_MAKE_OPTIONS) make -C $(HASH_PATH)
 
-sign: libXKCP.a ${SRC} ${AES_SRC} ${GF256_SRC} ${P251_SRC} ${CRYPTO_SRC} ${SDITH_SRC} ${KAT_MAIN_SRC}
-	-${CC} ${CFLAGS} ${AVXFLAGS} -o $@ ${SRC} ${AES_SRC} ${GF256_SRC} ${P251_SRC} ${CRYPTO_SRC} ${SDITH_SRC} ${KAT_MAIN_SRC} ${XKCP_PATH}/bin/${VARIANT}/libXKCP.a -I${XKCP_PATH}/bin/${VARIANT} -I. -lcrypto
+sign: ${SRC} ${FIELD_SRC} ${CRYPTO_SRC} ${SDITH_SRC} ${KAT_MAIN_SRC} libhash
+	-${CC} ${CFLAGS} ${AVXFLAGS} -o $@ ${SRC} ${FIELD_SRC} ${CRYPTO_SRC} ${SDITH_SRC} ${KAT_MAIN_SRC} -I. ${HASH_INCLUDE} -L${HASH_PATH} -lcrypto -lhash
 
 clean:
 	-rm -f *.o *.a sign
-	-cd ${XKCP_PATH} && ${MAKE} clean
+	$(HASH_MAKE_OPTIONS) make -C $(HASH_PATH) clean

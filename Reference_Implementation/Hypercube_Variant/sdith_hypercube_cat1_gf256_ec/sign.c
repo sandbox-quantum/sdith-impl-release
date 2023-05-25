@@ -1,16 +1,9 @@
 #include "api.h"
 
-#include "gf256.h"
-#include "gf2p24.h"
-#include "gf2p32.h"
-#include "p251.h"
-#include "p251p3.h"
-#include "p251p4.h"
 #include "sdith.h"
 
 #include <string.h>
 
-void fixedkeyaes_prf_init();
 int randombytes(unsigned char *x, unsigned long long xlen);
 
 #ifdef SUPERCOP
@@ -20,13 +13,7 @@ int randombytes(unsigned char *x, unsigned long long xlen);
 #endif
 
 int crypto_sign_keypair(unsigned char *pk, unsigned char *sk) {
-  gf256_init(0);
-  gf2p24_init();
-  gf2p32_mul_init();
-  p251_init_(0);
-  p251p4_mul_init();
-  p251p3_mul_init();
-  fixedkeyaes_prf_init();
+  field_init();
 
   sdith_compressed_pubkey_t c_pk;
   sdith_compressed_key_t c_sk;

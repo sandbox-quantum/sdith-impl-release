@@ -1,150 +1,168 @@
 #include "sdith.h"
 
 #include <immintrin.h>
-#include <openssl/evp.h>
 #include <sys/time.h>
 #include <string.h>
-
-
-#ifdef SUPERCOP
-#include <libkeccak.a.headers/KeccakHash.h>
-#include <libkeccak.a.headers/brg_endian.h>
-#else
-#include <libXKCP.a.headers/KeccakHash.h>
-#include <libXKCP.a.headers/brg_endian.h>
-#endif
 
 #include "assertions.h"
 #include "gf256.h"
 #include "gf2p24.h"
 #include "gf2p32.h"
+#include "param.h"
+#include "rng.h"
 
 #ifdef BENCHMARK
-#include "../bench/timer.h"
+#include "timer.h"
 sdith_bench_timer t0, t1, t2, t3, t4, t5;
 #endif
 
-RNG_CTX* sdith_rng_create_salted_rng_ctx(void const* const salt, void const* const seed) {
-  return sdith_rng_create_rng_ctx(seed, salt);
-}
-
-RNG_CTX* sdith_rng_create_seeded_rng_ctx(void const* const seed) {
-  uint8_t nonce[16] = {0};
-  return sdith_rng_create_rng_ctx(seed, nonce);
-}
-RNG_CTX* sdith_rng_create_commit_rng_ctx(void const* const commit) {
-  uint8_t nonce[16] = {0};
-  return sdith_rng_create_rng_ctx(commit, nonce);
-}
-RNG_CTX* sdith_rng_create_hash_rng_ctx(void const* const xhash) {
-  uint8_t nonce[16] = {0};
-  uint8_t seed[PARAM_seed_size];
-  sdith_hash(seed, sizeof(seed), xhash, PARAM_seed_size);
-  return sdith_rng_create_rng_ctx(seed, nonce);
-}
-
 int randombytes(unsigned char *x, unsigned long long xlen);
 
-
-sdith_params_t sdith_params;
-int sdith_params_initialized = 0;
-
-void init_sdith_params() {
-  if (sdith_params_initialized) return;
-  sdith_params_t* params = &sdith_params;
-
-  // fill in the Vandermonde matrix
-  for (uint64_t i=0; i<PARAM_q; ++i) {
-    for (uint64_t j=0; j<PARAM_q; ++j) {
-      params->VDM[i][j] = gf256_pow(i, j);
-      params->IVDM[i][j] = (i==j)?1:0;
-    }
+#ifdef NO_RANDOM
+int randombytes(unsigned char *x, unsigned long long xlen) {
+  for (uint64_t i = 0; i < xlen; ++i) {
+    x[i] = rand() & 0xff;
   }
-  // inverse it with Gaussian elimination (we can probably do better)
-  fpoly_t VDM[PARAM_q][PARAM_q];
-  memcpy(VDM, params->VDM, sizeof(VDM));
-  for (uint64_t i=0; i<PARAM_q; ++i) {
-    REQUIRE_DRAMATICALLY(VDM[i][i]!=0, "bug");
-    // normalize row i
-    fpoly_t invp = gf256_pow(VDM[i][i], 254);
-    for (uint64_t j=0; j<PARAM_q; ++j) {
-      VDM[i][j] = mul_gf256_table(VDM[i][j],invp);
-      params->IVDM[i][j] = mul_gf256_table(params->IVDM[i][j],invp);
-    }
-    //transvect other rows
-    for (uint64_t k=0; k<PARAM_q; ++k) {
-      if (k==i) continue;
-      fpoly_t coeff = VDM[k][i];
-      for (uint64_t j=0; j<PARAM_q; ++j) {
-        VDM[k][j] ^= mul_gf256_table(VDM[i][j],coeff);
-        params->IVDM[k][j] ^= mul_gf256_table(params->IVDM[i][j],coeff);
-      }
-    }
-  }
-  sdith_params_initialized = 1;
+  return 0;
 }
+#endif
 
+extern uint8_t f_poly[];
+extern uint8_t leading_coefficients_of_lj_for_S[];
+
+// If (X-alpha) divides P_in, returns P_in / (X-alpha)
+void remove_one_degree_factor_from_monic(fpoly_t* out, const fpoly_t* in, fpoly_t in_degree, fpoly_t alpha) {
+    out[in_degree-1] = 1;
+    for(int i=in_degree-2; i>=0; i--)
+        out[i] = in[i+1] ^ mul_gf256_naive(alpha, out[i+1]);
+}
 
 typedef struct isd_instance_struct {
   seed_t H_a_seed;
   ha_slice_t H_a[PAR_ha_nslice][PARAM_k] __attribute__((aligned (32))); // H_a is given by slices of 128 columns
   fsd_t y[PAR_y_size];
-  fsd_t x_A[PARAM_k];
+  fpoly_t s_A[PARAM_k];
+  fpoly_t q_poly[PARAM_d][PAR_wd];
+  fpoly_t p_poly[PARAM_d][PAR_wd];
 } isd_instance_t;
 
 isd_instance_t generate_inhomogeneous_sd_instance(sdith_compressed_key_t const* sk) {
   isd_instance_t reps;
   ASSERT_DRAMATICALLY(((uint64_t) (reps.H_a[0])) % 32 == 0, "bug!");
-  RNG_CTX *rng_ctx = sdith_rng_create_seeded_rng_ctx(sk->m_seed);
+  XOF_CTX *rng_ctx = sdith_rng_create_xof_ctx(sk->m_seed, PARAM_seed_size);
   uint8_t* random_tape = (uint8_t*)aligned_alloc(32, 8192);
   memset(random_tape, 0, 8192);
-  sdith_rng_next_bytes(rng_ctx, random_tape, 8192);
+  sdith_xof_next_bytes(rng_ctx, random_tape, 8192);
 
+#ifndef NDEBUG
+  fprintf(stdout, "sk seed: %s\n", hexmem(sk->m_seed, 16));
+  fprintf(stdout, "derived random_tape: %s\n", hexmem(random_tape, 64));
+#endif
 
   uint8_t* random_tape_ptr = random_tape;
 
-  // Generate x
+  // Generate x and s
   fsd_t x[PARAM_d][PAR_md];
+  memset(x, 0, sizeof(x));
+  fpoly_t s[PARAM_d][PAR_md];
+  memset(s, 0, sizeof(s));
+
   for (uint64_t i_d = 0; i_d < PARAM_d; ++i_d) {
-    uint8_t wd_remaining = PAR_wd;
-    for (uint64_t i = 0; i < PAR_md; ++i) {
-      // Sample random non-zero element b
-      uint8_t b = 0;
-      while(b==0) b = *(random_tape_ptr++);
+    uint8_t non_zero_pos[PAR_wd];
+    fsd_t non_zero_val[PAR_wd];
+    
+    uint64_t i = 0;
+    while (i < PAR_wd) {
+      // Sample random position
+      non_zero_pos[i] = *(random_tape_ptr++);
+      if (non_zero_pos[i] >= PAR_md) {
+        // Retry sampling if position invalid
+        continue;
+      }
 
-      // Whether we want weight at this position
-      uint64_t random_56 = 0;
-      memcpy(&random_56, random_tape_ptr, 7);
-      random_tape_ptr += 7;
-
-      uint64_t random_wd_sample = (PAR_md - i) * random_56;
-      uint64_t scaled_wd_remaining = (uint64_t)wd_remaining << 56;
-      uint8_t t = random_wd_sample < scaled_wd_remaining;
-
-      x[i_d][i] = b * t;
-      wd_remaining -= t;
+      // Check for redundancy
+      uint8_t is_redundant = 0;
+      for (uint64_t j = 0; j < i; ++j) {
+        if (non_zero_pos[i] == non_zero_pos[j]) {
+          is_redundant = 1;
+        }
+      }
+      if (!is_redundant) {
+        i++;
+      }
     }
-  }
-  fsd_t *x_full = (fsd_t*) x;
 
-  // x -> x_A || x_B
+    i = 0;
+    while (i < PAR_wd) {
+      // Sample random value
+      non_zero_val[i] = *(random_tape_ptr++);
+      if (non_zero_val[i] == 0) {
+        // Retry sampling if value is zero
+        continue;
+      }
+      i++;
+    }
+
+    // Reconstruct x
+    for (uint64_t i = 0; i < PAR_md; ++i) {
+      for (uint64_t j = 0; j < PAR_wd; ++j) {
+        x[i_d][i] ^= non_zero_val[j] * (i == non_zero_pos[j]);
+      }
+    }
+
+    // Build q poly = prod (X - j) where x_j is non zero.
+    fpoly_t q[PAR_wd + 1];
+    memset(q, 0, sizeof(q));
+    q[0] = 1;
+    for (uint64_t i = 0; i < PAR_wd; ++i) {
+      for (uint64_t j = i + 1; j >= 1; --j) {
+        q[j] = q[j-1] ^ mul_gf256_naive(q[j], non_zero_pos[i]);
+      }
+      q[0] = mul_gf256_naive(q[0], non_zero_pos[i]);
+    }
+    memcpy(reps.q_poly[i_d], q, sizeof(reps.q_poly[i_d]));
+
+    // Build s poly = sum_i l_i * x_i * F(X)/(X-f_i)
+    // Build p poly = sum_i l_i * x_i * Q(X)/(X-f_i)
+    fpoly_t p[PAR_wd];
+    memset(p, 0, sizeof(p));
+    for (uint64_t i = 0; i < PAR_md; ++i) {
+      fpoly_t scalar = mul_gf256_naive(leading_coefficients_of_lj_for_S[i], x[i_d][i]);
+
+      fpoly_t temp[PAR_md];
+      memset(temp, 0, sizeof(temp));
+      remove_one_degree_factor_from_monic(temp, f_poly, PAR_md, i);
+      for (uint64_t j = 0; j < PAR_md; j++) {
+        s[i_d][j] ^= mul_gf256_naive(temp[j], scalar);
+      }
+
+      remove_one_degree_factor_from_monic(temp, q, PAR_wd, i);
+      for (uint64_t j = 0; j < PAR_wd; j++) {
+        p[j] ^= mul_gf256_naive(temp[j], scalar);
+      }
+    }
+    memcpy(reps.p_poly[i_d], p, sizeof(reps.p_poly[i_d]));
+  }
+
+  // s -> s_A || s_B
+  fpoly_t *s_full = (fpoly_t*) s;
   for (uint64_t i = 0; i < PARAM_k; i++) {
-    reps.x_A[i] = x_full[i];
+    reps.s_A[i] = s_full[i];
   }
 
-  fsd_t x_B[PAR_y_size];
+  fpoly_t s_B[PAR_y_size];
   for (uint64_t i = 0; i < PAR_y_size; i++) {
-    x_B[i] = x_full[PARAM_k + i];
+    s_B[i] = s_full[PARAM_k + i];
   }
 
   // Sample H_a
   seed_t H_a_seed;
   memcpy(H_a_seed, random_tape_ptr, PARAM_seed_size);
   random_tape_ptr += PARAM_seed_size;
-  RNG_CTX *H_a_rng_ctx = sdith_rng_create_seeded_rng_ctx(H_a_seed);
+  XOF_CTX *H_a_rng_ctx = sdith_rng_create_xof_ctx(H_a_seed, PARAM_seed_size);
   fsd_t H_a[PARAM_k][PAR_y_size];
-  sdith_rng_next_bytes(H_a_rng_ctx, H_a, PARAM_k*PAR_y_size);
-  sdith_rng_free_rng_ctx(H_a_rng_ctx);
+  sdith_xof_next_bytes(H_a_rng_ctx, H_a, PARAM_k*PAR_y_size);
+  sdith_rng_free_xof_ctx(H_a_rng_ctx);
   // copy it slice by slice to reps
   memset(reps.H_a, 0, sizeof(reps.H_a));
   for (uint64_t j=0; j<PARAM_k; ++j) {
@@ -156,19 +174,78 @@ isd_instance_t generate_inhomogeneous_sd_instance(sdith_compressed_key_t const* 
     memcpy(reps.H_a[PAR_ha_nslice - 1][j], H_a[j] + (PAR_ha_nslice - 1) * 128, PAR_y_size%128);
   }
 
-  // Compute y = x_A * H_a + x_B
+  // Compute y = s_A * H_a + s_B
   ha_slice_t y[PAR_ha_nslice];
   {
     memset(y, 0, sizeof(y));
-    memcpy(y, x_B, PAR_y_size);
+    memcpy(y, s_B, PAR_y_size);
     for (uint64_t slice = 0; slice < PAR_ha_nslice; ++slice) {
-      gf256_vec_mat128cols_muladd_ct(y[slice], reps.x_A, reps.H_a[slice], PARAM_k);
+      gf256_vec_mat128cols_muladd_ct(y[slice], reps.s_A, reps.H_a[slice], PARAM_k);
     }
     memcpy(reps.y, y, PAR_y_size);
   }
 
   // Validate we have a working SD instance
-  sdith_rng_free_rng_ctx(rng_ctx);
+#ifndef NDEBUG
+  fpoly_t recomputed_s[PARAM_d][PAR_md];
+  fpoly_t* s_raw = (fpoly_t*) recomputed_s;
+  memcpy(s_raw, reps.s_A, PARAM_k);
+  memcpy(&s_raw[PARAM_k], reps.y, PAR_y_size);
+  for (uint64_t k=0; k<PARAM_k; ++k) {
+    for (uint64_t j = 0; j < PAR_y_size; ++j) {
+      s_raw[PARAM_k + j] ^= mul_gf256_naive(H_a[k][j], reps.s_A[k]);
+    }
+  }
+
+  for (uint64_t i_d=0; i_d<PARAM_d; ++i_d) {
+    // Rebuild x
+    fsd_t reconstructed_x[PAR_md];
+    for (uint64_t k=0; k<PAR_md; ++k) {
+      fsd_t c = 0;
+      for (uint64_t j=PAR_md; j>=1; --j) {
+        c = mul_gf256_naive(c, k) ^ recomputed_s[i_d][j-1];
+      }
+      reconstructed_x[k] = c;
+    }
+    int64_t weight = 0;
+    for (uint64_t i = 0; i < PAR_md; i++) {
+      if (reconstructed_x[i] != 0) weight++;
+    }
+    REQUIRE_DRAMATICALLY(weight == PAR_wd, "Hamming weight of solution exceeds required weight: %ld != %d", weight, PAR_wd);
+
+    // Verify Q(i) = 0 iff x_i != 0
+    for (uint64_t k=0; k<PAR_md; ++k) {
+      if (reconstructed_x[k] == 0) continue;
+      // Q is a monic polynomial with degree PAR_wd + 1
+      fsd_t c = 1;
+      for (uint64_t j=PAR_wd; j>=1; --j) {
+        c = mul_gf256_naive(c, k) ^ reps.q_poly[i_d][j-1];
+      }
+      REQUIRE_DRAMATICALLY(c == 0, "Q poly didn't cancel out on non-zero x[%ld]: %d", k, c);
+    }
+
+    // TODO(stevenyue): verify SQ-PF=0
+    // fpoints_t r = 1084129906;
+    // fpoints_t sr = 0;
+    // for (uint64_t j=PAR_md; j>=1; --j) {
+    //   sr = fpoints_mul(sr, r) ^ recomputed_s[i_d][j-1];
+    // }
+    // fpoints_t qr = 1;
+    // for (uint64_t j=PAR_wd; j>=1; --j) {
+    //   qr = fpoints_mul(qr, r) ^ reps.q_poly[i_d][j-1];
+    // }
+    // fpoints_t pr = 0;
+    // for (uint64_t j=PAR_wd; j>=1; --j) {
+    //   pr = fpoints_mul(pr, r) ^ reps.p_poly[i_d][j-1];
+    // }
+    // fpoints_t fr = 1;
+    // for (uint64_t j=PAR_md; j>=1; --j) {
+    //   fr = fpoints_mul(fr, r) ^ f_poly[j-1];
+    // }
+    // REQUIRE_DRAMATICALLY((fpoints_mul(sr, qr) ^ fpoints_mul(pr, fr)) == 0, "SQ-PF!=0");
+  }
+#endif
+  sdith_rng_free_xof_ctx(rng_ctx);
   memcpy(reps.H_a_seed, H_a_seed, PARAM_seed_size);
   free(random_tape);
   return reps;
@@ -188,69 +265,18 @@ void keygen(sdith_compressed_pubkey_t* pk, sdith_compressed_key_t* sk) {
 
 void uncompress_key(sdith_compressed_pubkey_t const* pk, sdith_compressed_key_t const* sk, sdith_full_pubkey_t* u_pk,
                     sdith_full_key_t* u_sk) {
-  // Regenerate parameters
-  init_sdith_params();
-
   // Regenerate I-SD instance
   isd_instance_t instance = generate_inhomogeneous_sd_instance(sk);
 
-  // Reconstruct x
-  ha_slice_t x_B_sl[PAR_ha_nslice];
-  fsd_t* x_B = (fsd_t*) *x_B_sl;
-  memset(x_B_sl, 0, sizeof(x_B_sl));
-  memcpy(x_B_sl, instance.y, PAR_y_size);
-  for (uint64_t slice=0; slice<PAR_ha_nslice; ++slice) {
-    gf256_vec_mat128cols_muladd_ct(x_B_sl[slice], instance.x_A, instance.H_a[slice], PARAM_k);
-  }
-  // TODO: here, we assume that fsd = fpoly
-  fpoly_t x[PARAM_d][PAR_md];
-  fsd_t *x_full = (fsd_t*) x;
-  memcpy(x_full, instance.x_A, PARAM_k);
-  memcpy(x_full+PARAM_k, x_B, PAR_y_size);
+  // copy polynomial to secret key
+  memcpy(u_sk->q_poly, instance.q_poly, sizeof(instance.q_poly));
+  memcpy(u_sk->p_poly, instance.p_poly, sizeof(instance.p_poly));
+  
+  // copy other materials
+  memcpy(&u_sk->compressed_pubkey, pk, sizeof(u_sk->compressed_pubkey));
+  memcpy(&u_pk->compressed_pubkey, pk, sizeof(u_pk->compressed_pubkey));
 
-  for (uint64_t i_d=0; i_d<PARAM_d; ++i_d) {
-    // Generate the polynomials Q(X) in GF2p8[X] monic of degree w whose roots are
-    // the non-zero positions of x
-    fpoly_t s[PARAM_q];           // interpolation of degree q-1
-    fpoly_t q[PAR_wd+1];          // monic of degree wd
-    fpoly_t sq[PARAM_q + PAR_wd]; // degree q+wd-1
-    // s = x * IVDM
-    for (uint64_t i=0; i<PARAM_q; ++i) {
-      fpoly_t c = 0;
-      for (uint64_t j=0; j<PAR_md; ++j) {
-        c ^= mul_gf256_naive(x[i_d][j], sdith_params.IVDM[i][j]);
-      }
-      s[i] = c;
-    }
-    // q = prod of X-root
-    memset(q, 0, PAR_wd+1);
-    q[0]=1;
-    for (uint64_t j=0; j<PAR_md; ++j) {
-      fpoly_t b = x[i_d][j];
-      fpoly_t a = (b!=0?1:0);
-      b = a?j:1;
-      for (uint64_t k=PAR_wd; k>=1; --k) {
-        q[k] = mul_gf256_naive(q[k],b) ^ mul_gf256_naive(q[k-1],a);
-      }
-      q[0] = mul_gf256_naive(q[0],b);
-    }
-    // sq = s * q : monomials from q to q+wd-1?
-    for (uint64_t i=PARAM_q; i<PARAM_q+PAR_wd; ++i) {
-      fpoly_t c=0;
-      for (uint64_t j=0; j<PARAM_q; ++j) {
-        if (i-j>PAR_wd) continue;
-        c ^= mul_gf256_naive(s[j], q[i-j]);
-      }
-      sq[i]=c;
-    }
-    // copy polynomial to secret key
-    memcpy(u_sk->p_poly[i_d], sq+PARAM_q, PAR_wd);
-    memcpy(u_sk->q_poly[i_d], q, PAR_wd);
-  }
-  u_sk->compressed_key = *sk;
-  u_pk->compressed_pubkey = *pk;
-  u_sk->compressed_pubkey = *pk;
-  memcpy(u_sk->x_A, instance.x_A, PARAM_k);
+  memcpy(u_sk->s_A, instance.s_A, PARAM_k);
   memcpy(u_pk->H_a, instance.H_a, sizeof(instance.H_a));
 }
 
@@ -258,10 +284,10 @@ void uncompress_pubkey(sdith_compressed_pubkey_t const* pk, sdith_full_pubkey_t*
   // Sample H_a
   seed_t H_a_seed;
   memcpy(H_a_seed, pk->H_a_seed, PARAM_seed_size);
-  RNG_CTX *H_a_rng_ctx = sdith_rng_create_seeded_rng_ctx(H_a_seed);
+  XOF_CTX *H_a_rng_ctx = sdith_rng_create_xof_ctx(H_a_seed, PARAM_seed_size);
   fsd_t H_a[PARAM_k][PAR_y_size];
-  sdith_rng_next_bytes(H_a_rng_ctx, H_a, PARAM_k*PAR_y_size);
-  sdith_rng_free_rng_ctx(H_a_rng_ctx);
+  sdith_xof_next_bytes(H_a_rng_ctx, H_a, PARAM_k*PAR_y_size);
+  sdith_rng_free_xof_ctx(H_a_rng_ctx);
   // copy it slice by slice to reps
   memset(u_pk->H_a, 0, sizeof(u_pk->H_a));
   for (uint64_t j=0; j<PARAM_k; ++j) {
@@ -295,7 +321,7 @@ void deserialize_sk(FILE* F, sdith_compressed_key_t* sk) {
 }
 
 typedef struct mpc_share_struct {
-  fpoly_t x_A[PARAM_k];
+  fpoly_t s_A[PARAM_k];
   fpoly_t q_poly[PARAM_d][PAR_wd];
   fpoly_t p_poly[PARAM_d][PAR_wd];
   fpoints_t a[PARAM_d][PARAM_t];
@@ -313,7 +339,7 @@ void xor_equals(mpc_share_t* x, const mpc_share_t* y) {
 
 #if 0
 typedef struct {
-  uint8_t share_raw[(params::x_A_size) /* x_A */ + params::w * 2 /* q_poly, p_poly */ +
+  uint8_t share_raw[(params::s_A_size) /* s_A */ + params::w * 2 /* q_poly, p_poly */ +
                     params::t * 3 /* a, b, c */ * 3 /* 3 bytes for GF2p24 */];
 } mpc_share_raw_t;
 
@@ -325,9 +351,9 @@ inline void operator^=(mpc_share_raw_t& x, mpc_share_raw_t y) {
 #endif
 
 /** @brief expand a leaf share from seed (any leaf except the last one) */
-void expand_mpc_share_from_seed(mpc_share_t* share, const seed_t seed, const salt_t salt) {
-  RNG_CTX* rng_ctx = sdith_rng_create_salted_rng_ctx(salt, seed);
-  sdith_rng_next_bytes(rng_ctx, share, sizeof(mpc_share_t));
+void expand_mpc_share_from_seed(mpc_share_t* share, const seed_t seed) {
+  XOF_CTX* rng_ctx = sdith_rng_create_xof_ctx((void*)seed, PARAM_seed_size);
+  sdith_xof_next_bytes(rng_ctx, share, sizeof(mpc_share_t));
   for (uint64_t i_d=0; i_d < PARAM_d; ++i_d) {
     for (uint64_t i = 0; i < PARAM_t; i++) {
       share->a[i_d][i] &= PAR_fpoint_mask;
@@ -335,22 +361,45 @@ void expand_mpc_share_from_seed(mpc_share_t* share, const seed_t seed, const sal
       share->c[i_d][i] &= PAR_fpoint_mask;
     }
   }
-  sdith_rng_free_rng_ctx(rng_ctx);
+  sdith_rng_free_xof_ctx(rng_ctx);
+}
+
+void expand_mpc_share_from_seed4(mpc_share_t** share, seed_t *seed) {
+  XOF4_CTX* rng_ctx = sdith_rng_create_xof4_ctx((void**)seed, PARAM_seed_size);
+  sdith_xof4_next_bytes(rng_ctx, (void**)share, sizeof(mpc_share_t));
+  for (uint64_t k = 0; k < 4; ++k) {
+    for (uint64_t i_d=0; i_d < PARAM_d; ++i_d) {
+      for (uint64_t i = 0; i < PARAM_t; i++) {
+        share[k]->a[i_d][i] &= PAR_fpoint_mask;
+        share[k]->b[i_d][i] &= PAR_fpoint_mask;
+        share[k]->c[i_d][i] &= PAR_fpoint_mask;
+      }
+    }
+  }
+  sdith_rng_free_xof4_ctx(rng_ctx);
 }
 
 /** @brief expand the random part of the last leaf share (i.e. a and b) from seed */
-void expand_last_mpc_share_from_seed(mpc_share_t* share, const seed_t seed, const salt_t salt) {
+void expand_last_mpc_share_from_seed(mpc_share_t* share, const seed_t seed) {
   // cur_share.a, cur_share.b <- PRNG()
-  RNG_CTX* rng_ctx = sdith_rng_create_salted_rng_ctx(salt, seed);
-  sdith_rng_next_bytes(rng_ctx, &share->a, PARAM_d * PARAM_t * 2 * sizeof(fpoints_t));
+  XOF_CTX* rng_ctx = sdith_rng_create_xof_ctx((void*)seed, PARAM_seed_size);
+  sdith_xof_next_bytes(rng_ctx, &share->a, PARAM_d * PARAM_t * 2 * sizeof(fpoints_t));
   for (uint64_t i_d=0; i_d < PARAM_d; ++i_d) {
     for (uint64_t i = 0; i < PARAM_t; ++i) {
       share->a[i_d][i] &= PAR_fpoint_mask;
       share->b[i_d][i] &= PAR_fpoint_mask;
     }
   }
-  sdith_rng_free_rng_ctx(rng_ctx);
+  sdith_rng_free_xof_ctx(rng_ctx);
 }
+
+typedef struct commit_vec {
+  seed_t seed;
+  uint8_t rho[PARAM_rho_size];
+  salt_t salt;
+  uint32_t iteration;
+  uint32_t leaf_idx;
+} commit_vec_t;
 
 /**
  * @brief commit a leaf share from seed (any leaf except the last one) -- sha3 commitments
@@ -361,38 +410,59 @@ void expand_last_mpc_share_from_seed(mpc_share_t* share, const seed_t seed, cons
  * @param leaf_idx   : leaf index between 0 and max_leaf
  */
 void commit_leaf(void* commitment, void const* leaf_seed, void const* leaf_rho, void const* salt, uint32_t iteration, uint32_t leaf_idx) {
-  HASH_CTX* share_commit_ctx = sdith_hash_create_hash_ctx();
+  HASH_CTX* share_commit_ctx = sdith_hash_create_hash_ctx(HASH_COM);
   // H0(seed ...)
   sdith_hash_digest_update(share_commit_ctx, leaf_seed, PARAM_seed_size);
   // H0(... || rho ...)
   sdith_hash_digest_update(share_commit_ctx, leaf_rho, PARAM_rho_size);
   // H0(... || salt ...)
   sdith_hash_digest_update(share_commit_ctx, salt, PARAM_salt_size);
+  uint32_t foo[2] = {iteration, leaf_idx};
   // H0(... || e ...)
-  sdith_hash_digest_update(share_commit_ctx, &iteration, sizeof(iteration));
-  // H0(... || i)
-  sdith_hash_digest_update(share_commit_ctx, &leaf_idx, sizeof(leaf_idx));
+  sdith_hash_digest_update(share_commit_ctx, foo, sizeof(foo));
+  // // H0(... || i)
+  // sdith_hash_digest_update(share_commit_ctx, &leaf_idx, sizeof(leaf_idx));
   // H1(... || H0^e_i ...)
-  sdith_hash_finalize(share_commit_ctx, commitment, PARAM_commit_size);
+  sdith_hash_final(share_commit_ctx, commitment, PARAM_commit_size);
   sdith_hash_free_hash_ctx(share_commit_ctx);
+}
+
+void commit4_leaf(void **commitment, void **leaf_seed, void **leaf_rho, void * salt, uint32_t iteration, uint32_t *leaf_idx) {
+  HASH4_CTX* share_commit4_ctx = sdith_hash_create_hash4_ctx(HASH_COM);
+  // H0(seed ...)
+  sdith_hash4_digest_update(share_commit4_ctx, leaf_seed, PARAM_seed_size);
+  // H0(... || rho ...)
+  sdith_hash4_digest_update(share_commit4_ctx, leaf_rho, PARAM_rho_size);
+  // H0(... || salt ...)
+  void *salts[4] = {salt, salt, salt, salt};
+  sdith_hash4_digest_update(share_commit4_ctx, salts, PARAM_salt_size);
+  // H0(... || e ...)
+  void *iters[4] = {&iteration, &iteration, &iteration, &iteration};
+  sdith_hash4_digest_update(share_commit4_ctx, iters, sizeof(iteration));
+  // H0(... || i)
+  void *leaves[4] = {&leaf_idx[0], &leaf_idx[1], &leaf_idx[2], &leaf_idx[3]};
+  sdith_hash4_digest_update(share_commit4_ctx, leaves, sizeof(uint32_t));
+  // H1(... || H0^e_i ...)
+  sdith_hash4_final(share_commit4_ctx, commitment, PARAM_commit_size);
+  sdith_hash_free_hash4_ctx(share_commit4_ctx);
 }
 
 /**
  * @brief expand a leaf share from seed (any leaf except the last one)
  * @param commitment : output commitment (of size params::commit_size)
  * @param leaf_seed  : the leaf seed (of size params::seed_size)
- * @param aux        : the auxiliary share (only x_a, p_poly, q_poly and c are accessed)
+ * @param aux        : the auxiliary share (only s_A, p_poly, q_poly and c are accessed)
  * @param salt       : the global salt
  * @param iteration  : iteration between 0 and tau-1
  */
 void commit_last_leaf(void* commitment, void const* leaf_seed, void const* leaf_rho, mpc_share_t const* aux, void const* salt,
                       uint32_t iteration) {
-  HASH_CTX* share_commit_ctx = sdith_hash_create_hash_ctx();
+  HASH_CTX* share_commit_ctx = sdith_hash_create_hash_ctx(HASH_COM);
   // H0(seed ...)
   sdith_hash_digest_update(share_commit_ctx, leaf_seed, PARAM_seed_size);
   // H0(... || rho ...)
   sdith_hash_digest_update(share_commit_ctx, leaf_rho, PARAM_rho_size);
-  // H0(... || x_A || q_poly || p_poly ...)
+  // H0(... || s_A || q_poly || p_poly ...)
   sdith_hash_digest_update(share_commit_ctx, aux, PARAM_k + PARAM_d * PAR_wd * 2);
   // H0(... || c ...)
   sdith_hash_digest_update(share_commit_ctx, aux->c, PARAM_d * PARAM_t * sizeof(fpoints_t));
@@ -403,7 +473,7 @@ void commit_last_leaf(void* commitment, void const* leaf_seed, void const* leaf_
   // H0(... || i)
   // hash::digest_update(share_commit_ctx, &state, sizeof(state));
   // H1(... || H0^e_i ...)
-  sdith_hash_finalize(share_commit_ctx, commitment, PARAM_commit_size);
+  sdith_hash_final(share_commit_ctx, commitment, PARAM_commit_size);
   sdith_hash_free_hash_ctx(share_commit_ctx);
 }
 
@@ -411,18 +481,18 @@ void commit_last_leaf(void* commitment, void const* leaf_seed, void const* leaf_
  * @brief commit the last leaf share from seed  + aux
  * @param commitment : output commitment (of size params::commit_size)
  * @param leaf_seed  : the leaf seed (of size params::seed_size)
- * @param aux        : the auxiliary share (only x_a, p_poly, q_poly and c are accessed)
+ * @param aux        : the auxiliary share (only s_A, p_poly, q_poly and c are accessed)
  * @param salt       : the global salt
  * @param iteration  : iteration between 0 and tau-1
  */
 void commit_last_leaf2(void* commitment, void const* leaf_seed, void const* leaf_rho, aux_share_t const* aux, void const* salt,
                       uint32_t iteration) {
-  HASH_CTX* share_commit_ctx = sdith_hash_create_hash_ctx();
+  HASH_CTX* share_commit_ctx = sdith_hash_create_hash_ctx(HASH_COM);
    // H0(seed ...)
   sdith_hash_digest_update(share_commit_ctx, leaf_seed, PARAM_seed_size);
   // H0(... || rho ...)
   sdith_hash_digest_update(share_commit_ctx, leaf_rho, PARAM_rho_size);
-  // H0(... || x_A || q_poly || p_poly ...)
+  // H0(... || s_A || q_poly || p_poly ...)
   sdith_hash_digest_update(share_commit_ctx, aux, PARAM_k + PARAM_d * PAR_wd * 2);
   // H0(... || c ...)
   sdith_hash_digest_update(share_commit_ctx, aux->c, PARAM_d * PARAM_t * sizeof(fpoints_t));
@@ -433,7 +503,7 @@ void commit_last_leaf2(void* commitment, void const* leaf_seed, void const* leaf
   // H0(... || i)
   // hash::digest_update(share_commit_ctx, &state, sizeof(state));
   // H1(... || H0^e_i ...)
-  sdith_hash_finalize(share_commit_ctx, commitment, PARAM_commit_size);
+  sdith_hash_final(share_commit_ctx, commitment, PARAM_commit_size);
   sdith_hash_free_hash_ctx(share_commit_ctx);
 }
 
@@ -467,11 +537,13 @@ void expand_seed_binary_tree_bfs(sdith_full_key_t const* sk, seed_t root_seed,
   seed_t *previous_level = seeds;
   seed_t *current_level = seeds + 1;
   uint64_t current_level_n = 2;
+  uint64_t first_tweak = 1;
   for (uint64_t d = 1; d <= PARAM_D; ++d) {
-    sdith_tree_prg_seed_prng_expand(tree_ctx, current_level, previous_level, current_level_n);
+    sdith_tree_prg_seed_expand(tree_ctx, current_level, previous_level, first_tweak, iteration, current_level_n);
     previous_level = current_level;
     current_level = previous_level + current_level_n;
     current_level_n <<= 1;
+    first_tweak <<= 1;
   }
 //  #ifndef NDEBUG
 //    for (uint64_t i=1; i<2*num_leafs; ++i) {
@@ -483,27 +555,39 @@ void expand_seed_binary_tree_bfs(sdith_full_key_t const* sk, seed_t root_seed,
   seed_t *const leaf_level = previous_level;
   // expand the leaf states (except the last one) from their seed and update the sum and the main shares
   mpc_share_t cur_share;
-  for (uint64_t i = 0; i < num_leafs - 1; ++i) {
-    seed_t leaf_seed;
-    uint8_t leaf_rho[PARAM_rho_size];
+  for (uint64_t i = 0; i < num_leafs - 1; i += 4) {
+    seed_t leaf_seed[4];
+    uint8_t leaf_rho[4][PARAM_rho_size];
+    void *leaf_rho_ptr[4] = {leaf_rho[0], leaf_rho[1], leaf_rho[2], leaf_rho[3]};
+    sdith_tree_prg_leaf_expand4(tree_ctx, &leaf_level[i], leaf_seed, (uint8_t**)leaf_rho_ptr);
+    
+    void *leaf_seed_ptr[4] = {leaf_seed[0], leaf_seed[1], leaf_seed[2], leaf_seed[3]};
+    uint32_t idx[4] = {i, i+1, i+2, i+3};
+    void *commits_ptr[4] = {commits[i], commits[i+1], commits[i+2], commits[i+3]};
+    commit4_leaf((void**)commits_ptr, (void**)leaf_seed_ptr, (void**)leaf_rho_ptr, salt, iteration, idx);
 
-    RNG_CTX* leaf_seed_rng_ctx = sdith_rng_create_salted_rng_ctx(salt, leaf_level[i]);
-    sdith_rng_next_bytes(leaf_seed_rng_ctx, leaf_seed, PARAM_seed_size);
-    sdith_rng_next_bytes(leaf_seed_rng_ctx, leaf_rho, PARAM_rho_size);
-    commit_leaf(commits[i], leaf_seed, leaf_rho, salt, iteration, i);
-    sdith_rng_free_rng_ctx(leaf_seed_rng_ctx);
+    mpc_share_t shares[4];
+    memset(shares, 0, sizeof(shares));
+    mpc_share_t *shares_ptr[4] = {&shares[0], &shares[1], &shares[2], &shares[3]};
+    expand_mpc_share_from_seed4((mpc_share_t**)shares_ptr, (seed_t*)leaf_seed_ptr);
 
-    memset(&cur_share, 0, sizeof(mpc_share_t));
-    expand_mpc_share_from_seed(&cur_share, leaf_seed, salt);
-    // add it to the aux
-    xor_equals(aux, &cur_share);
-    // add it to the main parties
-    for (uint64_t j = 0; j < PARAM_D; ++j) {
-      if (((i >> (PARAM_D - 1 - j)) & 1) == 0) {
-        xor_equals(&main_party_shares[j][0], &cur_share);
+    for (uint64_t k = 0; k < 4; ++k) {
+      // skip the last share as it's specially derived
+      if (i + k >= num_leafs - 1) {
+        break;
       }
-      if ((i >> (PARAM_D - 1 - j)) & 1) {
-        xor_equals(&main_party_shares[j][1], &cur_share);
+      // add it to the aux
+      xor_equals(aux, &shares[k]);
+      // add it to the main parties
+      for (uint64_t j = 0; j < PARAM_D; ++j) {
+        if ((((i + k) >> (PARAM_D - 1 - j)) & 1) == 0) {
+          xor_equals(&main_party_shares[j][0], &shares[k]);
+        }
+  // #ifndef NDEBUG
+        if (((i + k) >> (PARAM_D - 1 - j)) & 1) {
+          xor_equals(&main_party_shares[j][1], &shares[k]);
+        }
+  // #endif
       }
     }
   }
@@ -511,19 +595,15 @@ void expand_seed_binary_tree_bfs(sdith_full_key_t const* sk, seed_t root_seed,
   {
     seed_t leaf_seed;
     uint8_t leaf_rho[PARAM_rho_size];
-
-    RNG_CTX* leaf_seed_rng_ctx = sdith_rng_create_salted_rng_ctx(salt, leaf_level[num_leafs - 1]);
-    sdith_rng_next_bytes(leaf_seed_rng_ctx, leaf_seed, PARAM_seed_size);
-    sdith_rng_next_bytes(leaf_seed_rng_ctx, leaf_rho, PARAM_rho_size);
-    sdith_rng_free_rng_ctx(leaf_seed_rng_ctx);
+    sdith_tree_prg_leaf_expand(tree_ctx, leaf_level[num_leafs - 1], leaf_seed, leaf_rho);
 
     // expand the random part from the seed
     memset(&cur_share, 0, sizeof(mpc_share_t));
-    expand_last_mpc_share_from_seed(&cur_share, leaf_seed, salt);
+    expand_last_mpc_share_from_seed(&cur_share, leaf_seed);
     xor_equals(aux, &cur_share);
     // correct the current share so that the sum is equal to the plaintext
 
-    memcpy(sum_share->x_A, sk->x_A, PARAM_k);
+    memcpy(sum_share->s_A, sk->s_A, PARAM_k);
     memcpy(sum_share->q_poly, sk->q_poly, PARAM_d * PAR_wd);
     memcpy(sum_share->p_poly, sk->p_poly, PARAM_d * PAR_wd);
     // cur_share.c = aux.c ^ (aux.a * aux.b)  element wise
@@ -537,7 +617,7 @@ void expand_seed_binary_tree_bfs(sdith_full_key_t const* sk, seed_t root_seed,
     }
     // cur_share.xa = aux.xa ^ sk.xa
     for (uint64_t i = 0; i < PARAM_k; i++) {
-      cur_share.x_A[i] = aux->x_A[i] ^ sk->x_A[i];
+      cur_share.s_A[i] = aux->s_A[i] ^ sk->s_A[i];
     }
     // cur_share.Q = aux.Q ^ sk.Q
     // cur_share.P = aux.P ^ sk.P
@@ -549,10 +629,12 @@ void expand_seed_binary_tree_bfs(sdith_full_key_t const* sk, seed_t root_seed,
     }
     *aux = cur_share;
 
+// #ifndef NDEBUG
     // add it to the main parties
     for (uint64_t j = 0; j < PARAM_D; ++j) {
       xor_equals(&main_party_shares[j][1], &cur_share);
     }
+// #endif
 
     // commit to the last leaf (sha3 commitment)
     commit_last_leaf(commits[num_leafs - 1], leaf_seed, leaf_rho, aux, salt, iteration);
@@ -598,22 +680,21 @@ void walk_full_tree_prg_bfs(const seed_t* seeds, const commit_t* commits, const 
     pp = (pp >> 1) ^ 1;
   }
   memcpy(chal_commit, commits[path], PARAM_commit_size);
-  
-  RNG_CTX* leaf_seed_rng_ctx = sdith_rng_create_salted_rng_ctx(salt, seeds[(1 << PARAM_D) - 1 + path]);
+
   seed_t leaf_seed;
-  sdith_rng_next_bytes(leaf_seed_rng_ctx, leaf_seed, PARAM_seed_size);
-  sdith_rng_free_rng_ctx(leaf_seed_rng_ctx);
+  uint8_t leaf_rho[PARAM_rho_size];
+  TREE_PRG_CTX* ctx = sdith_create_tree_prg_ctx(salt);
+  sdith_tree_prg_leaf_expand(ctx, seeds[(1 << PARAM_D) - 1 + path], leaf_seed, leaf_rho);
 
   if (path != (1 << PARAM_D) - 1) {
-    expand_mpc_share_from_seed(chal_share, leaf_seed, salt);
+    expand_mpc_share_from_seed(chal_share, leaf_seed);
   } else {
-    expand_last_mpc_share_from_seed(chal_share, leaf_seed, salt);
-    memcpy(chal_share->x_A, aux->x_A, PARAM_k);
+    expand_last_mpc_share_from_seed(chal_share, leaf_seed);
+    memcpy(chal_share->s_A, aux->s_A, PARAM_k);
     memcpy(chal_share->q_poly, aux->q_poly, PARAM_d * PAR_wd);
     memcpy(chal_share->p_poly, aux->p_poly, PARAM_d * PAR_wd);
     memcpy(chal_share->c, aux->c, PARAM_d * PARAM_t * sizeof(fpoints_t));
   }
-
   return;
 }
 
@@ -630,7 +711,7 @@ void walk_full_tree_prg_bfs(const seed_t* seeds, const commit_t* commits, const 
 void walk_tree_prg_bfs(const seed_t root_seed, const salt_t salt,
                        uint32_t iteration, uint32_t path, mpc_share_t const* aux,
                        seed_t tree_prg_seeds[PARAM_D],
-                       commit_t chal_commit, mpc_share_t* chal_share) {
+                       commit_t chal_commit) {
   const uint64_t num_leafs = (1ul << PARAM_D);
   seed_t *const seeds = (seed_t*) aligned_alloc(32, PARAM_seed_size * 3);
   uint8_t *const prev_seed = seeds[0];
@@ -639,51 +720,38 @@ void walk_tree_prg_bfs(const seed_t root_seed, const salt_t salt,
   // Initialize TreePRG state
   TREE_PRG_CTX* tree_ctx = sdith_create_tree_prg_ctx(salt);
   memcpy(prev_seed, root_seed, PARAM_seed_size);
-//  #ifndef NDEBUG
-//     fprintf(stdout, "WPath: %d\n",path);
-//     fprintf(stdout, "WRoot: %s\n", hexmem(prev_seed, PARAM_seed_size));
-//  #endif
 
   // deduce the seeds of the other levels
+  uint64_t current_tweak = 1;                // root tweak
   for (uint64_t d = 1; d <= PARAM_D; ++d) {  // WIP!!!!
-    sdith_tree_prg_seed_prng_expand(tree_ctx, cur_seeds, prev_seed, 2);
-//    #ifndef NDEBUG
-//         fprintf(stdout, "Wnode: %ld %s\n", 2*previous_tweak, hexmem(cur_seeds[0], PARAM_seed_size));
-//         fprintf(stdout, "Wnode: %ld %s\n", 2*previous_tweak+1, hexmem(cur_seeds[1], PARAM_seed_size));
-//   #endif
+    sdith_tree_prg_seed_expand(tree_ctx, cur_seeds, prev_seed, current_tweak, iteration, 2);
     if ((path >> (PARAM_D - d)) & 1) {
       // store sibling left seed
       memcpy(tree_prg_seeds[d - 1], cur_seeds[0], PARAM_seed_size);
       // extend from right
+      current_tweak = 2 * current_tweak + 1;
       memcpy(prev_seed, cur_seeds[1], PARAM_seed_size);
     } else {
       // store sibling right seed
       memcpy(tree_prg_seeds[d - 1], cur_seeds[1], PARAM_seed_size);
       // extend from left
+      current_tweak = 2 * current_tweak;
       memcpy(prev_seed, cur_seeds[0], PARAM_seed_size);
     }
   }
+  // finally, the challenge seed is the last live seed
+  ASSERT_DRAMATICALLY(current_tweak == (1 << PARAM_D) + path, "Bug!!")
   // finally, the challenge seed is the last live seed
   // memcpy(chal_seed, prev_seed, params::seed_size);
   uint8_t const* const chal_seed = prev_seed;
 
   seed_t leaf_seed;
   uint8_t leaf_rho[PARAM_rho_size];
-
-  RNG_CTX* leaf_seed_rng_ctx = sdith_rng_create_salted_rng_ctx(salt, chal_seed);
-  sdith_rng_next_bytes(leaf_seed_rng_ctx, leaf_seed, PARAM_seed_size);
-  sdith_rng_next_bytes(leaf_seed_rng_ctx, leaf_rho, PARAM_rho_size);
-  sdith_rng_free_rng_ctx(leaf_seed_rng_ctx);
+  sdith_tree_prg_leaf_expand(tree_ctx, chal_seed, leaf_seed, leaf_rho);
 
   if (path == num_leafs - 1) {
-    expand_last_mpc_share_from_seed(chal_share, leaf_seed, salt);
-    memcpy(chal_share->x_A, aux->x_A, PARAM_k);
-    memcpy(chal_share->q_poly, aux->q_poly, PARAM_d * PAR_wd);
-    memcpy(chal_share->p_poly, aux->p_poly, PARAM_d * PAR_wd);
-    memcpy(chal_share->c, aux->c, PARAM_d * PARAM_t * sizeof(fpoints_t));
     commit_last_leaf(chal_commit, leaf_seed, leaf_rho, aux, salt, iteration);
   } else {
-    expand_mpc_share_from_seed(chal_share, leaf_seed, salt);
     commit_leaf(chal_commit, leaf_seed, leaf_rho, salt, iteration, path);
   }
   // #ifndef NDEBUG
@@ -725,15 +793,17 @@ void expand_seed_binary_tree_with_hint_bfs(seed_t *seed_hint, uint32_t hint,
   seed_t *previous_level = seeds + 0;
   seed_t *current_level = seeds + 1;
   uint64_t current_level_n = 2;
+  uint64_t current_tweak = 1;
   for (uint64_t d = 1; d <= PARAM_D; ++d) {
     // expand all the seeds from level d-1 to d
-    sdith_tree_prg_seed_prng_expand(tree_ctx, current_level, previous_level, current_level_n);
+    sdith_tree_prg_seed_expand(tree_ctx, current_level, previous_level, current_tweak, iteration, current_level_n);
     // correct the seed using the sibling seed
     uint64_t index_sibling = (hint >> (PARAM_D - d)) ^ 1;
     memcpy(current_level[index_sibling], seed_hint[d - 1], PARAM_seed_size);
     previous_level = current_level;
     current_level = previous_level + current_level_n;
     current_level_n <<= 1;
+    current_tweak <<= 1;
   }
 //  #ifndef NDEBUG
 //    fprintf(stdout, "Vpath: %d\n", hint);
@@ -746,26 +816,35 @@ void expand_seed_binary_tree_with_hint_bfs(seed_t *seed_hint, uint32_t hint,
   seed_t *const leaf_level = previous_level;
   // expand the leaf states (except the last one) from their seed and update the sum and the main shares
   mpc_share_t cur_share;
-  for (uint64_t i = 0; i < num_leafs - 1; ++i) {
-    seed_t leaf_seed;
-    uint8_t leaf_rho[PARAM_rho_size];
+  for (uint64_t i = 0; i < num_leafs - 1; i += 4) {
+    seed_t leaf_seed[4];
+    uint8_t leaf_rho[4][PARAM_rho_size];
+    void *leaf_rho_ptr[4] = {leaf_rho[0], leaf_rho[1], leaf_rho[2], leaf_rho[3]};
+    sdith_tree_prg_leaf_expand4(tree_ctx, &leaf_level[i], leaf_seed, (uint8_t**)leaf_rho_ptr);
+    
+    void *leaf_seed_ptr[4] = {leaf_seed[0], leaf_seed[1], leaf_seed[2], leaf_seed[3]};
+    uint32_t idx[4] = {i, i+1, i+2, i+3};
+    void *commits_ptr[4] = {commits[i], commits[i+1], commits[i+2], commits[i+3]};
+    commit4_leaf((void**)commits_ptr, (void**)leaf_seed_ptr, (void**)leaf_rho_ptr, salt, iteration, idx);
 
-    RNG_CTX* leaf_seed_rng_ctx = sdith_rng_create_salted_rng_ctx(salt, leaf_level[i]);
-    sdith_rng_next_bytes(leaf_seed_rng_ctx, leaf_seed, PARAM_seed_size);
-    sdith_rng_next_bytes(leaf_seed_rng_ctx, leaf_rho, PARAM_rho_size);
-    sdith_rng_free_rng_ctx(leaf_seed_rng_ctx);
+    mpc_share_t shares[4];
+    memset(shares, 0, sizeof(shares));
+    mpc_share_t *shares_ptr[4] = {&shares[0], &shares[1], &shares[2], &shares[3]};
+    expand_mpc_share_from_seed4((mpc_share_t*)shares_ptr, (seed_t*)leaf_seed_ptr);
 
-    commit_leaf(commits[i], leaf_seed, leaf_rho, salt, iteration, i);
-
-    if (i == hint) continue;  // skip the hidden leaf
-    memset(&cur_share, 0, sizeof(mpc_share_t));
-    expand_mpc_share_from_seed(&cur_share, leaf_seed, salt);
-    xor_equals(sum_share, &cur_share);
-    // add it to the main parties
-    for (uint64_t j = 0; j < PARAM_D; ++j) {
-      if ((((i ^ hint) >> (PARAM_D - 1 - j)) & 1) == 1) {
-        // TODO get rid of leaf>>(D-1-j)&1 with the proper function signature
-        xor_equals(&main_party_shares[j][(i >> (PARAM_D - 1 - j)) & 1], &cur_share);
+    for (uint64_t k = 0; k < 4; ++k) {
+      // skip the last share as it's specially derived
+      if (i + k >= num_leafs - 1) {
+        break;
+      }
+      if (i + k == hint) continue;  // skip the hidden leaf
+      xor_equals(sum_share, &shares[k]);
+      // add it to the main parties
+      for (uint64_t j = 0; j < PARAM_D; ++j) {
+        if (((((i + k) ^ hint) >> (PARAM_D - 1 - j)) & 1) == 1) {
+          // TODO get rid of leaf>>(D-1-j)&1 with the proper function signature
+          xor_equals(&main_party_shares[j][((i + k) >> (PARAM_D - 1 - j)) & 1], &shares[k]);
+        }
       }
     }
   }
@@ -775,11 +854,7 @@ void expand_seed_binary_tree_with_hint_bfs(seed_t *seed_hint, uint32_t hint,
   if (hint != num_leafs - 1) {
     seed_t leaf_seed;
     uint8_t leaf_rho[PARAM_rho_size];
-
-    RNG_CTX* leaf_seed_rng_ctx = sdith_rng_create_salted_rng_ctx(salt, leaf_level[num_leafs - 1]);
-    sdith_rng_next_bytes(leaf_seed_rng_ctx, leaf_seed, PARAM_seed_size);
-    sdith_rng_next_bytes(leaf_seed_rng_ctx, leaf_rho, PARAM_rho_size);
-    sdith_rng_free_rng_ctx(leaf_seed_rng_ctx);
+    sdith_tree_prg_leaf_expand(tree_ctx, leaf_level[num_leafs - 1], leaf_seed, leaf_rho);
 
     // commitment of the last leaf is from seed + aux
     commit_last_leaf2(commits[num_leafs - 1], leaf_seed, leaf_rho, aux, salt, iteration);
@@ -787,9 +862,9 @@ void expand_seed_binary_tree_with_hint_bfs(seed_t *seed_hint, uint32_t hint,
     const uint32_t leaf = num_leafs - 1;
     // expand the random part from the seed
     memset(&cur_share, 0, sizeof(mpc_share_t));
-    expand_last_mpc_share_from_seed(&cur_share, leaf_seed, salt);
+    expand_last_mpc_share_from_seed(&cur_share, leaf_seed);
     // correct the current share using the aux
-    memcpy(cur_share.x_A, aux->x_A, PARAM_k);
+    memcpy(cur_share.s_A, aux->s_A, PARAM_k);
     memcpy(cur_share.q_poly, aux->q_poly, PARAM_d * PAR_wd);
     memcpy(cur_share.p_poly, aux->p_poly, PARAM_d * PAR_wd);
     memcpy(cur_share.c, aux->c, PARAM_d * PARAM_t * sizeof(fpoints_t));
@@ -812,16 +887,12 @@ void expand_seed_binary_tree_with_hint_bfs(seed_t *seed_hint, uint32_t hint,
 
 #define compressed_helper_t 16  // TODO generalize or not?
 typedef struct mpc_helper_struct {
-  uint8_t compressed_u[PAR_md][compressed_helper_t] __attribute__ ((aligned (32)));              // log(uk) s.t S(r) = sum uk.S(k)
-  uint8_t compressed_pow_r[PAR_wd + 1][compressed_helper_t]; __attribute__ ((aligned (32)))      // log(r^p)
-  uint8_t compressed_eps_pow_r[PAR_wd + 1][compressed_helper_t];  __attribute__ ((aligned (32))) // log(eps*r^p)
+  uint8_t compressed_pow_r[PAR_md + 1][compressed_helper_t]; __attribute__ ((aligned (32)))      // log(r^p)
+  uint8_t compressed_eps_pow_r[PAR_md + 1][compressed_helper_t];  __attribute__ ((aligned (32))) // log(eps*r^p)
   uint32_t eps_f_r[PARAM_t];             // log(eps*F(r))
 } mpc_helper_t;
 
 void init(mpc_helper_t* helper) { memset(helper, 0, sizeof(*helper)); }
-void helper_set_u(mpc_helper_t* helper, uint64_t k, uint64_t i_t, const fpoints_t value) {
-  memcpy(&helper->compressed_u[k][PARAM_fpoint_size * i_t], &value, PARAM_fpoint_size);
-}
 void helper_set_eps_pow_r(mpc_helper_t* helper, uint64_t p, uint64_t i_t, const fpoints_t value) {
   memcpy(&helper->compressed_eps_pow_r[p][PARAM_fpoint_size * i_t], &value, PARAM_fpoint_size);
 }
@@ -836,70 +907,44 @@ void helper_unpack_row(fpoints_t dst[PARAM_t], const uint8_t src[compressed_help
 }
 
 void generate_mpc_helper(mpc_helper_t* mpc_helper, uint32_t* r, uint32_t* eps) {
-  static const uint64_t order = PAR_fpoint_mask;
-  // logu[i_t][k] = dlog24 ( prod_{kk!=k} (r[i_tau][i_t] - f_kk) )
   for (uint64_t i_t = 0; i_t < PARAM_t; i_t++) {
-    uint64_t sum_log_r_xor_k = 0; // sum(log(r^k))
-    if (r[i_t] <= 255) {  // if it is in the GF2p8
-      for (uint64_t k = 0; k < PAR_md; k++) {
-        helper_set_u(mpc_helper, k, i_t, (r[i_t] == k));
-      }
-      sum_log_r_xor_k = PAR_fpoint_mask; // 0
-    } else {
-      // otherwise, none of the terms in the product are zero,
-      //  just use the sum of logs
-      uint32_t log_r_xor_k[PARAM_q];     // log(r ^ k)
-      for (uint64_t k = 0; k < PARAM_q; k++) {
-        uint32_t l = fpoints_dlog(r[i_t] ^ k);
-        log_r_xor_k[k] = l;
-        sum_log_r_xor_k += l;
-      }
-      sum_log_r_xor_k %= order;
-      for (uint64_t k = 0; k < PAR_md; k++) {
-        helper_set_u(mpc_helper, k, i_t,
-                     sum_log_r_xor_k >= log_r_xor_k[k] ? fpoints_dexp(sum_log_r_xor_k - log_r_xor_k[k])
-                                                       : fpoints_dexp(order + sum_log_r_xor_k - log_r_xor_k[k]));
-      }
-    }
-
-    // logpowr[i_t][p] = dlog24(pow_24(r[i_tau][i_t]), p))
     uint32_t log_eps = fpoints_dlog(eps[i_t]);
     uint32_t log_r = fpoints_dlog(r[i_t]);
-    for (uint64_t p = 0; p < PAR_wd + 1; p++) {
+    for (uint64_t p = 0; p < PAR_md + 1; p++) {
       uint32_t log_r_p = fpoints_dlog_pow_log(log_r, p);
       helper_set_eps_pow_r(mpc_helper, p, i_t, fpoints_dexp(fpoints_dlog_mul_log_log(log_eps, log_r_p)));
       helper_set_pow_r(mpc_helper, p, i_t, fpoints_dexp(log_r_p));
     }
-
-  // logepsFr[i_t] = dlog24(eps[i_tau][i_t]) * (pow_24( r[i_tau][i_t]), 256)
-  // - r[i_tau][i_t] )))
-    mpc_helper->eps_f_r[i_t] = fpoints_dexp(fpoints_dlog_mul_log_log(log_eps,sum_log_r_xor_k));
   }
+  uint8_t eps_f_r_compressed[compressed_helper_t];
+  memset(eps_f_r_compressed, 0, sizeof(eps_f_r_compressed));
+  gf256_vec_mat16cols_muladd(eps_f_r_compressed, f_poly, mpc_helper->compressed_eps_pow_r, PAR_md + 1);
+  helper_unpack_row(mpc_helper->eps_f_r, eps_f_r_compressed);
 }
 
 typedef int bool;
 
 void mpc_compute_plain_broadcasts(mpc_share_t const *share, bool with_offsets, mpc_helper_t const helper[PARAM_d],
                             sdith_full_pubkey_t const* pk, fpoints_t alphas[PARAM_d][PARAM_t],
-                            fpoints_t betas [PARAM_d][PARAM_t]) {
-  // x = x_A || x_B
+                            uint32_t betas [PARAM_d][PARAM_t]) {
+  // x = s_A || s_B
   uint8_t* x = (uint8_t*)aligned_alloc(32, PARAM_k + PAR_ha_nslice * 128);
-  uint8_t* x_A = x;
-  uint8_t* x_B = x + PARAM_k;
-  memcpy(x_A, share->x_A, PARAM_k);
-  memset(x_B, 0, PAR_ha_nslice * 128);
-  if (with_offsets) memcpy(x_B, pk->compressed_pubkey.y, PAR_y_size);
+  uint8_t* s_A = x;
+  uint8_t* s_B = x + PARAM_k;
+  memcpy(s_A, share->s_A, PARAM_k);
+  memset(s_B, 0, PAR_ha_nslice * 128);
+  if (with_offsets) memcpy(s_B, pk->compressed_pubkey.y, PAR_y_size);
 
-  // x_B = x_A H_A ^ y
-  // x_A H_A = [<x_A, H_A_0>, ..., <x_A, H_A_k-1>]
+  // s_B = s_A H_A ^ y
+  // s_A H_A = [<s_A, H_A_0>, ..., <s_A, H_A_k-1>]
   for (uint64_t slice=0; slice<PAR_ha_nslice; ++slice) {
-    gf256_vec_mat128cols_muladd_ct(x_B + 128*slice, x_A, pk->H_a[slice], PARAM_k);
+    gf256_vec_mat128cols_muladd_ct(s_B + 128*slice, s_A, pk->H_a[slice], PARAM_k);
   }
 
   for (uint64_t i_d=0; i_d < PARAM_d; ++i_d) {
     uint32_t s_r[PARAM_t] = {0};
     uint8_t compressed_s_r[16] __attribute__ ((aligned (32))) = {0};
-    gf256_vec_mat16cols_muladd_ct(compressed_s_r, x + i_d * PAR_md, helper[i_d].compressed_u, PAR_md);
+    gf256_vec_mat16cols_muladd_ct(compressed_s_r, x + i_d * PAR_md, helper[i_d].compressed_pow_r, PAR_md);
     helper_unpack_row(s_r, compressed_s_r);
 
     memset(alphas[i_d], 0, PARAM_t * sizeof(fpoints_t));
@@ -922,25 +967,25 @@ void mpc_compute_communications(mpc_share_t const* share, bool with_offsets, mpc
                                 sdith_full_pubkey_t const* pk, const fpoints_t alphas[PARAM_d][PARAM_t],
                                 const fpoints_t betas[PARAM_d][PARAM_t], fpoints_t alpha[PARAM_d][PARAM_t], fpoints_t beta[PARAM_d][PARAM_t],
                                 fpoints_t v[PARAM_t], bool CONSTANT_TIME) {
-  // x = x_A || x_B
+  // x = s_A || s_B
   uint8_t* x = (uint8_t*)aligned_alloc(32, PARAM_k + PAR_ha_nslice * 128);
-  uint8_t* x_A = x;
-  uint8_t* x_B = x + PARAM_k;
-  memcpy(x_A, share->x_A, PARAM_k);
-  memset(x_B, 0, PAR_ha_nslice * 128);
+  uint8_t* s_A = x;
+  uint8_t* s_B = x + PARAM_k;
+  memcpy(s_A, share->s_A, PARAM_k);
+  memset(s_B, 0, PAR_ha_nslice * 128);
   if (with_offsets) {
-    memcpy(x_B, pk->compressed_pubkey.y, PAR_y_size);
+    memcpy(s_B, pk->compressed_pubkey.y, PAR_y_size);
   }
 
-  // x_B = x_A H_A ^ y
-  // x_A H_A = [<x_A, H_A_0>, ..., <x_A, H_A_k-1>]
+  // s_B = s_A H_A ^ y
+  // s_A H_A = [<s_A, H_A_0>, ..., <s_A, H_A_k-1>]
   if (CONSTANT_TIME) {  // if on a template
     for (uint64_t slice=0; slice<PAR_ha_nslice; ++slice) {
-      gf256_vec_mat128cols_muladd_ct(x_B + 128*slice, x_A, pk->H_a[slice], PARAM_k);
+      gf256_vec_mat128cols_muladd_ct(s_B + 128*slice, s_A, pk->H_a[slice], PARAM_k);
     }
   } else {
     for (uint64_t slice=0; slice<PAR_ha_nslice; ++slice) {
-      gf256_vec_mat128cols_muladd(x_B + 128*slice, x_A, pk->H_a[slice], PARAM_k);
+      gf256_vec_mat128cols_muladd(s_B + 128*slice, s_A, pk->H_a[slice], PARAM_k);
     }
   }
 
@@ -949,11 +994,16 @@ void mpc_compute_communications(mpc_share_t const* share, bool with_offsets, mpc
     fpoints_t s_r[PARAM_t] = {0};
     uint8_t compressed_s_r[16]  __attribute__ ((aligned (32))) = {0};
     if (CONSTANT_TIME) {  // if on a template
-      gf256_vec_mat16cols_muladd_ct(compressed_s_r, x + PAR_md * i_d, helper[i_d].compressed_u, PAR_md);
+      gf256_vec_mat16cols_muladd_ct(compressed_s_r, x + i_d * PAR_md, helper[i_d].compressed_pow_r, PAR_md);
     } else {
-      gf256_vec_mat16cols_muladd(compressed_s_r, x + PAR_md * i_d, helper[i_d].compressed_u, PAR_md);
+      gf256_vec_mat16cols_muladd(compressed_s_r, x + i_d * PAR_md, helper[i_d].compressed_pow_r, PAR_md);
     }
     helper_unpack_row(s_r, compressed_s_r);
+#ifndef NDEBUG
+    for (uint64_t i_t = 0; i_t < PARAM_t; ++i_t) {
+      REQUIRE_DRAMATICALLY((s_r[i_t] & (~PAR_fpoint_mask)) == 0, "bug");
+    }
+#endif
 
     memset(alpha[i_d], 0, PARAM_t * sizeof(fpoints_t));
     uint8_t compressed_alpha[16]  __attribute__ ((aligned (32)))= {0};
@@ -1012,9 +1062,12 @@ void free_sdith_ctx(sdith_ctx_t* ctx) { free(ctx); }
 void sign_offline(sdith_ctx_t* ctx, sdith_full_pubkey_t __attribute__((unused)) const* pk, sdith_full_key_t const* sk) {
   // Sample random salt
   randombytes(ctx->salt, PARAM_salt_size);
+#ifndef NDEBUG
+  fprintf(stdout, "Salt: %s\n", hexmem(ctx->salt, PARAM_salt_size));
+#endif
 
   // Create message commitment context
-  ctx->msg_commit_ctx = sdith_hash_create_hash_ctx();
+  ctx->msg_commit_ctx = sdith_hash_create_hash_ctx(HASH_H1);
   // We intentially skip H(m) and move it to the online phase
   // H1(salt ...)
   sdith_hash_digest_update(ctx->msg_commit_ctx, ctx->salt, PARAM_salt_size);
@@ -1059,24 +1112,27 @@ void sign_online(sdith_ctx_t* ctx, sdith_full_pubkey_t const* pk, sdith_full_key
 #endif
   // Obtain H1
   hash_t h1;
-  sdith_hash_finalize(ctx->msg_commit_ctx, h1, PARAM_hash_size);
+  sdith_hash_final(ctx->msg_commit_ctx, h1, PARAM_hash_size);
   sdith_hash_free_hash_ctx(ctx->msg_commit_ctx);
+#ifndef NDEBUG
+  fprintf(stdout, "H1: %s\n", hexmem(h1, sizeof(h1)));
+#endif
 
   // Create H2 context
-  ctx->msg_commit_ctx = sdith_hash_create_hash_ctx();
+  ctx->msg_commit_ctx = sdith_hash_create_hash_ctx(HASH_H2);
   // H2(salt ...)
   sdith_hash_digest_update(ctx->msg_commit_ctx, ctx->salt, PARAM_salt_size);
   // H2(... || h1 ...)
   sdith_hash_digest_update(ctx->msg_commit_ctx, h1, PARAM_hash_size);
 
   // Use H1 as PRNG seed to extract challenge values
-  RNG_CTX* chal_prg = sdith_rng_create_hash_rng_ctx(h1);
+  XOF_CTX* chal_prg = sdith_rng_create_xof_ctx(h1, PARAM_hash_size);
 
   fpoints_t r[PARAM_tau][PARAM_d][PARAM_t];
   fpoints_t eps[PARAM_tau][PARAM_d][PARAM_t];
-  sdith_rng_next_bytes(chal_prg, r, sizeof(r));
-  sdith_rng_next_bytes(chal_prg, eps, sizeof(eps));
-  sdith_rng_free_rng_ctx(chal_prg);
+  sdith_xof_next_bytes(chal_prg, r, sizeof(r));
+  sdith_xof_next_bytes(chal_prg, eps, sizeof(eps));
+  sdith_rng_free_xof_ctx(chal_prg);
   for (uint64_t i = 0; i < PARAM_tau; i++) {
     for (uint64_t i_d = 0; i_d < PARAM_d; ++i_d) {
       for (uint64_t j = 0; j < PARAM_t; j++) {
@@ -1120,8 +1176,19 @@ void sign_online(sdith_ctx_t* ctx, sdith_full_pubkey_t const* pk, sdith_full_key
 
       mpc_compute_communications(&ctx->main_party_shares[e][i][1], /* with_offsets= */ 1, mpc_helpers[e], pk,
                                        alpha, beta, sh_alpha[1], sh_beta[1], sh_v[1], 1);
+#ifndef NDEBUG
+      for (uint64_t i_d = 0; i_d < PARAM_d; i_d++) {
+        for (uint64_t i_t = 0; i_t < PARAM_t; i_t++) {
+          REQUIRE_DRAMATICALLY((sh_alpha[0][i_d][i_t] ^ sh_alpha[1][i_d][i_t]) == alpha[i_d][i_t], "MPC alphas doesn't sum to alpha.");
+          REQUIRE_DRAMATICALLY((sh_beta[0][i_d][i_t] ^ sh_beta[1][i_d][i_t]) == beta[i_d][i_t], "MPC betas doesn't sum to beta.");
+        }
+      }
+      for (uint64_t i_t = 0; i_t < PARAM_t; i_t++) {
+        REQUIRE_DRAMATICALLY((sh_v[0][i_t] ^ sh_v[1][i_t]) == 0, "MPC v doesn't sum to 0.");
+      }
+#endif
 
-
+      // we include only party 0 in the communications hash
       for (uint64_t party = 0; party < 2; party++) {
         // H2(... || sh_alpha[party][i_t] ...)
         sdith_hash_digest_update(ctx->msg_commit_ctx, sh_alpha[party], sizeof(sh_alpha[party]));
@@ -1148,8 +1215,11 @@ void sign_online(sdith_ctx_t* ctx, sdith_full_pubkey_t const* pk, sdith_full_key
   sdith_hash_digest_update(ctx->msg_commit_ctx, msg, msgBytes);
   // Obtain H2
   hash_t h2;
-  sdith_hash_finalize(ctx->msg_commit_ctx, h2, PARAM_hash_size);
+  sdith_hash_final(ctx->msg_commit_ctx, h2, PARAM_hash_size);
   sdith_hash_free_hash_ctx(ctx->msg_commit_ctx);
+#ifndef NDEBUG
+  fprintf(stdout, "H2: %s\n", hexmem(h2, sizeof(h2)));
+#endif
 
 #ifdef PROOF_OF_WORK
   uint8_t h2_pow_in[PARAM_hash_size * 2];
@@ -1158,25 +1228,24 @@ void sign_online(sdith_ctx_t* ctx, sdith_full_pubkey_t const* pk, sdith_full_key
   memcpy(h2_pow, h2, PARAM_hash_size);
   for (uint64_t j = 0; j < (1 << PAR_POW_iter); j++) {
     memcpy(&h2_pow_in[PARAM_hash_size], h2_pow, PARAM_hash_size);
-    HASH_CTX* h2_pow_ctx = sdith_hash_create_hash_ctx();
+    HASH_CTX* h2_pow_ctx = sdith_hash_create_hash_ctx(HASH_H2);
     sdith_hash_digest_update(h2_pow_ctx, h2_pow_in, sizeof(h2_pow_in));
-    sdith_hash_finalize(h2_pow_ctx, h2_pow, PARAM_hash_size);
+    sdith_hash_final(h2_pow_ctx, h2_pow, PARAM_hash_size);
     sdith_hash_free_hash_ctx(h2_pow_ctx);
   }
 #endif
 
   // Use H2 as PRNG seed to extract challenge values
 #ifdef PROOF_OF_WORK
-  chal_prg = sdith_rng_create_hash_rng_ctx(h2_pow);
+  chal_prg = sdith_rng_create_xof_ctx(h2_pow, PARAM_hash_size);
 #else
-  chal_prg = sdith_rng_create_hash_rng_ctx(h2);
+  chal_prg = sdith_rng_create_xof_ctx(h2, PARAM_hash_size);
 #endif
   uint64_t chal[PARAM_tau];
-  sdith_rng_next_bytes(chal_prg, chal, sizeof(chal));
-  sdith_rng_free_rng_ctx(chal_prg);
+  sdith_xof_next_bytes(chal_prg, chal, sizeof(chal));
+  sdith_rng_free_xof_ctx(chal_prg);
 
   memcpy(signature.salt, ctx->salt, sizeof(ctx->salt));
-  memcpy(signature.h1, h1, sizeof(h1));
   memcpy(signature.h2, h2, sizeof(h2));
 
 #ifdef BENCHMARK
@@ -1195,19 +1264,19 @@ void sign_online(sdith_ctx_t* ctx, sdith_full_pubkey_t const* pk, sdith_full_key
 
     if (challenge != chal_mask) {
       // Populate the signature with aux info
-      memcpy(signature.aux[e].x_A, ctx->aux[e].x_A, sizeof(ctx->aux[e].x_A));
+      memcpy(signature.aux[e].s_A, ctx->aux[e].s_A, sizeof(ctx->aux[e].s_A));
       memcpy(signature.aux[e].q_poly, ctx->aux[e].q_poly, sizeof(ctx->aux[e].q_poly));
       memcpy(signature.aux[e].p_poly, ctx->aux[e].p_poly, sizeof(ctx->aux[e].p_poly));
       memcpy(signature.aux[e].c, ctx->aux[e].c, sizeof(ctx->aux[e].c));
     }
-mpc_share_t chal_share;
+    mpc_share_t chal_share;
 #ifdef FULL_TREE
-    walk_full_tree_prg_bfs(ctx->all_seeds[e], ctx->all_commits[e], challenge, signature.tree_prg_seeds[e], signature.com[e], &chal_share, ctx->salt, &ctx->aux[e]);
+    walk_full_tree_prg_bfs(ctx->all_seeds[e], ctx->all_commits[e],challenge, signature.tree_prg_seeds[e], signature.com[e], &chal_share, ctx->salt, &ctx->aux[e]);
 #else
     walk_tree_prg_bfs(ctx->root_seeds[e], ctx->salt, e, challenge, &ctx->aux[e], signature.tree_prg_seeds[e],
-                      signature.com[e], &chal_share);
+                      signature.com[e]);
 #endif
-  mpc_compute_plain_broadcasts(&chal_share, challenge == (1 << PARAM_D) - 1, mpc_helpers[e], pk, alpha[e], beta[e]);
+    mpc_compute_plain_broadcasts(&chal_share, challenge == (1 << PARAM_D) - 1, mpc_helpers[e], pk, alpha[e], beta[e]);
   }
 
   uint8_t* alpha_raw = (uint8_t*)alpha;
@@ -1262,24 +1331,7 @@ int verify(sdith_full_pubkey_t const* pk, void const* msg, int msgBytes, void co
   signature_t signature;
   memcpy(&signature, sig, sizeof(signature));
 
-  // Extract challenges r, eps, and i*
-  // Use H1 as PRNG seed to extract challenge values
-  RNG_CTX* chal_prg = sdith_rng_create_hash_rng_ctx(signature.h1);
-
-  fpoints_t r[PARAM_tau][PARAM_d][PARAM_t];
-  fpoints_t eps[PARAM_tau][PARAM_d][PARAM_t];
-  sdith_rng_next_bytes(chal_prg, r, sizeof(r));
-  sdith_rng_next_bytes(chal_prg, eps, sizeof(eps));
-  sdith_rng_free_rng_ctx(chal_prg);
-  for (uint64_t i = 0; i < PARAM_tau; i++) {
-    for (uint64_t i_d=0; i_d<PARAM_d; ++i_d) {
-      for (uint64_t j = 0; j < PARAM_t; j++) {
-        r[i][i_d][j] &= PAR_fpoint_mask;
-        eps[i][i_d][j] &= PAR_fpoint_mask;
-      }
-    }
-  }
-
+  XOF_CTX* chal_prg;
   // Use H2 as PRNG seed to extract challenge values
 #ifdef PROOF_OF_WORK
   uint8_t h2_pow_in[PARAM_hash_size * 2];
@@ -1288,21 +1340,21 @@ int verify(sdith_full_pubkey_t const* pk, void const* msg, int msgBytes, void co
   memcpy(h2_pow, signature.h2, PARAM_hash_size);
   for (uint64_t j = 0; j < (1 << PAR_POW_iter); j++) {
     memcpy(&h2_pow_in[PARAM_hash_size], h2_pow, PARAM_hash_size);
-    HASH_CTX *h2_pow_ctx = sdith_hash_create_hash_ctx();
+    HASH_CTX *h2_pow_ctx = sdith_hash_create_hash_ctx(HASH_H2);
     sdith_hash_digest_update(h2_pow_ctx, h2_pow_in, sizeof(h2_pow_in));
-    sdith_hash_finalize(h2_pow_ctx, h2_pow, PARAM_hash_size);
+    sdith_hash_final(h2_pow_ctx, h2_pow, PARAM_hash_size);
     sdith_hash_free_hash_ctx(h2_pow_ctx);
   }
-  chal_prg = sdith_rng_create_hash_rng_ctx(h2_pow);
+  chal_prg = sdith_rng_create_xof_ctx(h2_pow, PARAM_hash_size);
 #else
-  chal_prg = sdith_rng_create_hash_rng_ctx(signature.h2);
+  chal_prg = sdith_rng_create_xof_ctx(signature.h2, PARAM_hash_size);
 #endif
   uint64_t chal[PARAM_tau];
-  sdith_rng_next_bytes(chal_prg, chal, sizeof(chal));
-  sdith_rng_free_rng_ctx(chal_prg);
+  sdith_xof_next_bytes(chal_prg, chal, sizeof(chal));
+  sdith_rng_free_xof_ctx(chal_prg);
 
   // Create message commitment context
-  HASH_CTX *msg_commit_ctx = sdith_hash_create_hash_ctx();
+  HASH_CTX *msg_commit_ctx = sdith_hash_create_hash_ctx(HASH_H1);
   // H1(salt ...)
   sdith_hash_digest_update(msg_commit_ctx, signature.salt, PARAM_salt_size);
 
@@ -1339,14 +1391,33 @@ int verify(sdith_full_pubkey_t const* pk, void const* msg, int msgBytes, void co
 
   // Obtain H1
   hash_t h1;
-  sdith_hash_finalize(msg_commit_ctx, h1, PARAM_hash_size);
+  sdith_hash_final(msg_commit_ctx, h1, PARAM_hash_size);
   sdith_hash_free_hash_ctx(msg_commit_ctx);
-  if (memcmp(h1, signature.h1, PARAM_hash_size)) {
-    return -1;
+
+#ifndef NDEBUG
+  fprintf(stdout, "H1: %s\n", hexmem(h1, sizeof(h1)));
+#endif
+
+  // Extract challenges r, eps, and i*
+  // Use H1 as PRNG seed to extract challenge values
+  chal_prg = sdith_rng_create_xof_ctx(h1, PARAM_hash_size);
+
+  fpoints_t r[PARAM_tau][PARAM_d][PARAM_t];
+  fpoints_t eps[PARAM_tau][PARAM_d][PARAM_t];
+  sdith_xof_next_bytes(chal_prg, r, sizeof(r));
+  sdith_xof_next_bytes(chal_prg, eps, sizeof(eps));
+  sdith_rng_free_xof_ctx(chal_prg);
+  for (uint64_t i = 0; i < PARAM_tau; i++) {
+    for (uint64_t i_d=0; i_d<PARAM_d; ++i_d) {
+      for (uint64_t j = 0; j < PARAM_t; j++) {
+        r[i][i_d][j] &= PAR_fpoint_mask;
+        eps[i][i_d][j] &= PAR_fpoint_mask;
+      }
+    }
   }
 
   // Create H2 context
-  msg_commit_ctx = sdith_hash_create_hash_ctx();
+  msg_commit_ctx = sdith_hash_create_hash_ctx(HASH_H2);
   // H2(salt ...)
   sdith_hash_digest_update(msg_commit_ctx, signature.salt, PARAM_salt_size);
   // H2(... || h1 ...)
@@ -1385,7 +1456,7 @@ int verify(sdith_full_pubkey_t const* pk, void const* msg, int msgBytes, void co
     fpoints_t beta[PARAM_d][PARAM_t];
     mpc_compute_plain_broadcasts(&sum_shares[e], challenge != (1 << PARAM_D) - 1, mpc_helpers[e], pk, alpha, beta);
 
-    // Add alpha, beta of i* to the global alpha, beta
+    // // Add alpha, beta of i* to the global alpha, beta
     for (uint64_t i_d = 0; i_d < PARAM_d; i_d++) {
       for (uint64_t i_t = 0; i_t < PARAM_t; i_t++) {
         alpha[i_d][i_t] ^= chal_alpha[e][i_d][i_t];
@@ -1429,9 +1500,12 @@ int verify(sdith_full_pubkey_t const* pk, void const* msg, int msgBytes, void co
   sdith_hash_digest_update(msg_commit_ctx, msg, msgBytes);
   // Obtain H2
   hash_t h2;
-  sdith_hash_finalize(msg_commit_ctx, h2, PARAM_hash_size);
+  sdith_hash_final(msg_commit_ctx, h2, PARAM_hash_size);
   sdith_hash_free_hash_ctx(msg_commit_ctx);
   if (memcmp(h2, signature.h2, PARAM_hash_size)) {
+#ifndef NDEBUG
+  fprintf(stderr, "Verification failed: H2 should be equal.\n");
+#endif
     return -1;
   }
 
@@ -1439,6 +1513,12 @@ int verify(sdith_full_pubkey_t const* pk, void const* msg, int msgBytes, void co
 }
 
 int sig_size() { return sizeof(signature_t); }
+
+void field_init() {
+  gf256_init(0);
+  gf2p24_init();
+  gf2p32_mul_init();
+}
 
 const char *hexmem(void const *x, uint64_t nbytes) {
   static __thread char *last_reps = NULL;
@@ -1456,10 +1536,10 @@ const char *hexmem(void const *x, uint64_t nbytes) {
 
 const char* hashmem(void const* x, uint64_t nbytes) {
   //minihash for debugging only
-  HASH_CTX* ctx = sdith_hash_create_hash_ctx();
+  HASH_CTX* ctx = sdith_hash_create_hash_ctx(0);
   sdith_hash_digest_update(ctx, x, nbytes);
   uint8_t minihash[8];
-  sdith_hash_finalize(ctx, minihash, 8);
+  sdith_hash_final(ctx, minihash, 8);
   return hexmem(minihash, 8);
 }
 

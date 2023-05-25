@@ -1,58 +1,72 @@
-#include <openssl/evp.h>
+#include <stdint.h>
 #include <stdlib.h>
+#include <sys/types.h>
 
 #include "param.h"
-
-#ifdef SUPERCOP
-#include <libkeccak.a.headers/KeccakHash.h>
-#else
-#include <libXKCP.a.headers/KeccakHash.h>
-#endif
-
 #include "rng.h"
+#include "sha3/KeccakHash.h"
+#include "sha3/KeccakHashtimes4.h"
 
-HASH_CTX* sdith_hash_create_hash_ctx() {
-#ifndef XKCP
-  const EVP_MD* md = EVP_shake128();
-  EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-  EVP_DigestInit_ex(ctx, md, NULL);
-  return (HASH_CTX*)ctx;
+HASH_CTX *sdith_hash_create_hash_ctx(uint8_t prefix) {
+  Keccak_HashInstance *inst =
+      (Keccak_HashInstance *)malloc(sizeof(Keccak_HashInstance));
+#if defined(CAT_1)
+  Keccak_HashInitialize_SHA3_256(inst);
+#elif defined(CAT_3)
+  Keccak_HashInitialize_SHA3_384(inst);
 #else
-  Keccak_HashInstance* ctx = (Keccak_HashInstance*) malloc(sizeof(Keccak_HashInstance));
-  Keccak_HashInitialize_SHAKE128(ctx);
-  return (HASH_CTX*) ctx;
+  Keccak_HashInitialize_SHA3_512(inst);
 #endif
+  Keccak_HashUpdate(inst, &prefix, sizeof(uint8_t) << 3);
+  return (HASH_CTX *)inst;
 }
 
-void sdith_hash_free_hash_ctx(HASH_CTX* ctx) {
-#ifndef XKCP
-  EVP_MD_CTX_free((EVP_MD_CTX*)ctx);
-#else
-  free(ctx);
-#endif
+void sdith_hash_free_hash_ctx(HASH_CTX *ctx) { free(ctx); }
+
+void sdith_hash_digest_update(HASH_CTX *ctx, void const *in, int inBytes) {
+  Keccak_HashUpdate((Keccak_HashInstance *)ctx, (uint8_t const *)in,
+                    inBytes << 3);
 }
 
-void sdith_hash_digest_update(HASH_CTX* ctx, void const* in, int inBytes) {
-#ifndef XKCP
-  EVP_DigestUpdate((EVP_MD_CTX*)ctx, in, inBytes);
-#else
-  Keccak_HashUpdate((Keccak_HashInstance*)ctx, (uint8_t const*)in, inBytes << 3);
-#endif
+void sdith_hash_final(HASH_CTX *ctx, void *dest, int destBytes) {
+  Keccak_HashFinal((Keccak_HashInstance *)ctx, dest);
 }
 
-void sdith_hash_finalize(HASH_CTX* ctx, void* dest, int destBytes) {
-#ifndef XKCP
-  EVP_DigestFinalXOF((EVP_MD_CTX*)ctx, (unsigned char*)dest, destBytes);
-#else
-  Keccak_HashFinal((Keccak_HashInstance*)ctx, NULL);
-  Keccak_HashSqueeze((Keccak_HashInstance*)ctx, (uint8_t*)dest, destBytes << 3);
-#endif
-}
-
-void sdith_hash(void* dest, int destBytes, void const* data, int dataBytes) {
-  HASH_CTX* ctx = sdith_hash_create_hash_ctx();
+void sdith_hash(uint8_t prefix, void *dest, int destBytes, void const *data, int dataBytes) {
+  HASH_CTX *ctx = sdith_hash_create_hash_ctx(prefix);
   sdith_hash_digest_update(ctx, data, dataBytes);
-  sdith_hash_finalize(ctx, dest, destBytes);
+  sdith_hash_final(ctx, dest, destBytes);
   sdith_hash_free_hash_ctx(ctx);
 }
 
+static Keccak_HashInstancetimes4 hash4_ctx;
+
+HASH4_CTX *sdith_hash_create_hash4_ctx(uint8_t prefix) {
+#if defined(CAT_1)
+  Keccak_HashInitializetimes4_SHA3_256(&hash4_ctx);
+#elif defined(CAT_3)
+  Keccak_HashInitializetimes4_SHA3_384(&hash4_ctx);
+#else
+  Keccak_HashInitializetimes4_SHA3_512(&hash4_ctx);
+#endif
+  uint8_t *prefix_ptr[4] = {&prefix, &prefix, &prefix, &prefix};
+  Keccak_HashUpdatetimes4(&hash4_ctx, prefix_ptr, sizeof(prefix) << 3);
+  return (HASH4_CTX *)&hash4_ctx;
+}
+
+void sdith_hash_free_hash4_ctx(HASH4_CTX *ctx) {}
+
+void sdith_hash4_digest_update(HASH4_CTX *ctx, void **in, int inBytes) {
+  Keccak_HashUpdatetimes4((Keccak_HashInstancetimes4 *)ctx, in, inBytes << 3);
+}
+
+void sdith_hash4_final(HASH4_CTX *ctx, void **dest, int destBytes) {
+  Keccak_HashFinaltimes4((Keccak_HashInstancetimes4 *)ctx, dest);
+}
+
+void sdith_hash4(uint8_t prefix, void **dest, int destBytes, void **data, int dataBytes) {
+  HASH4_CTX *ctx = sdith_hash_create_hash4_ctx(prefix);
+  sdith_hash4_digest_update(ctx, data, dataBytes);
+  sdith_hash4_final(ctx, dest, destBytes);
+  sdith_hash_free_hash4_ctx(ctx);
+}

@@ -14,7 +14,15 @@ EXPORT void gf2p24_init() {
   gf256_init(0);
   //TODO currently, only the naive version of gf2p24_mul is available
   gf2p24_mul = gf2p24_mul_table;
+#ifdef AVX2
+  if (__builtin_cpu_supports("avx2")) {
+    gf2p24_mul_ct = gf2p24_mul_pclmul_ct;
+  } else {
+    gf2p24_mul_ct = mul_gf2p24_naive;
+  }
+#else
   gf2p24_mul_ct = mul_gf2p24_naive;
+#endif
   gf2p24_create_log_tables();
   gf2p24_is_initialized = 1;
 }
@@ -90,6 +98,16 @@ void gf2p24_create_log_tables() {
   for (uint64_t i = 0; i < (1ul << 24); ++i) {
     dlog24_table[dexp24_table[i]] = i;
   }
+#ifndef NDEBUG
+  for (uint64_t i = 0; i < (1ul << 8); ++i) {
+    uint32_t el = dexp24_table[i * 0x10101];
+    REQUIRE_DRAMATICALLY(el <= 255, "dexp[%ld]=%d is not in GF2p8\n", i * 0x10101, el);
+  }
+  for (uint64_t i = 0; i < (1ul << 8); ++i) {
+    uint32_t le = dlog24_table[i];
+    REQUIRE_DRAMATICALLY(le % 0x10101 == 0, "dlog[%ld]=%d\n", i, le);
+  }
+#endif  // NDEBUG
   sdith_gf2p24_dexp_table = dexp24_table;
   sdith_gf2p24_dlog_table = dlog24_table;
 }

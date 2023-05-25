@@ -14,10 +14,32 @@ EXPORT int gf256_init_avx2();
 EXPORT void gf256_init_gfni();
 EXPORT void gf256_init_pclmul_ct();
 EXPORT void gf256_init(__attribute__((unused)) uint8_t verbose) {
+#ifdef AVX2
+  gf256_init_avx2_polytable_ct();
+  gf256_init_avx2();
+  gf256_init_pclmul_ct();
+#ifdef __GFNI__
+  gf256_init_gfni();
+  if (__builtin_cpu_supports("gfni")) {
+    gf256_vec_mat16cols_muladd = gf256_vec_mat16cols_muladd_gfni_ct;
+    gf256_vec_mat16cols_muladd_ct = gf256_vec_mat16cols_muladd_gfni_ct;
+    gf256_vec_mat128cols_muladd = gf256_vec_mat128cols_muladd_gfni_ct;
+    gf256_vec_mat128cols_muladd_ct = gf256_vec_mat128cols_muladd_gfni_ct;
+    return;
+  }
+#endif // __GFNI
+  // TODO: use the processor caps to assign the best candidate,
+  // TODO: currently assuming avx2 is available
+  gf256_vec_mat16cols_muladd = gf256_vec_mat16cols_muladd_avx2;
+  gf256_vec_mat16cols_muladd_ct = gf256_vec_mat16cols_muladd_pclmul_ct;
+  gf256_vec_mat128cols_muladd = gf256_vec_mat128cols_muladd_avx2;
+  gf256_vec_mat128cols_muladd_ct = gf256_vec_mat128cols_muladd_polytable_avx2_ct;
+#else
   gf256_vec_mat16cols_muladd = gf256_vec_mat16cols_muladd_ref_ct;
   gf256_vec_mat16cols_muladd_ct = gf256_vec_mat16cols_muladd_ref_ct;
   gf256_vec_mat128cols_muladd = gf256_vec_mat128cols_muladd_ref_ct;
   gf256_vec_mat128cols_muladd_ct = gf256_vec_mat128cols_muladd_ref_ct;
+#endif // AVX2
 }
 
 /** @brief naive gf256 multiplication */
@@ -122,6 +144,12 @@ void gf256_create_log_tables() {
   for (uint64_t i = 0; i < 256; ++i) {
     dlog8_table[dexp8_table[i]] = i;
   }
+#ifndef NDEBUG
+  for (uint64_t i = 0; i < (1ul << 8); ++i) {
+    REQUIRE_DRAMATICALLY(dlog8_table[dexp8_table[i]] == i, "bug: %ld %ld %ld\n", i, (uint64_t)(dexp8_table[i]),
+                         (uint64_t)(dlog8_table[dexp8_table[i]]));
+  }
+#endif
   sdith_gf256_dexp_table = dexp8_table;
   sdith_gf256_dlog_table = dlog8_table;
 }

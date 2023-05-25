@@ -56,22 +56,15 @@ typedef struct {
 
 /** @brief expanded secret key type */
 typedef struct {
-  sdith_compressed_key_t compressed_key;
   sdith_compressed_pubkey_t compressed_pubkey;
-  fsd_t x_A[PARAM_k];
+  fsd_t s_A[PARAM_k];
   fpoly_t q_poly[PARAM_d][PAR_wd];
   fpoly_t p_poly[PARAM_d][PAR_wd];
 } sdith_full_key_t;
 
-/** @brief public static parameters */
-typedef struct {
-  fpoly_t VDM[PARAM_q][PARAM_q]; // Full Vandermonde matrix
-  fpoly_t IVDM[PARAM_q][PARAM_q]; // Inverse Vandermonde matrix
-} sdith_params_t;
-
 // TODO(stevenyue): Move types into an internal header.
 typedef struct aux_share_struct {
-  uint8_t x_A[PARAM_k];
+  uint8_t s_A[PARAM_k];
   uint8_t q_poly[PARAM_d][PAR_wd];
   uint8_t p_poly[PARAM_d][PAR_wd];
   uint32_t c[PARAM_d][PARAM_t];
@@ -79,7 +72,6 @@ typedef struct aux_share_struct {
 
 typedef struct signature_struct {
   salt_t salt;
-  hash_t h1;
   hash_t h2;
   seed_t tree_prg_seeds[PARAM_tau][PARAM_D];
   commit_t com[PARAM_tau];
@@ -88,25 +80,12 @@ typedef struct signature_struct {
   fpoints_c_t compressed_beta[PARAM_tau][PARAM_d][PARAM_t];
 } signature_t;
 
-typedef struct RNG_struct RNG_CTX;
-
-/** @brief initialize sdith static parameters */
-void init_sdith_params();
-
-/** @brief create a salt+seed rng context out of a 16-bytes salt + 16 bytes seed */
-RNG_CTX* sdith_rng_create_salted_rng_ctx(void const* const salt, void const* const seed);
-/** @brief create a seeded rng context out of a 16-bytes seed */
-RNG_CTX* sdith_rng_create_seeded_rng_ctx(void const* const seed);
-/** @brief create a seeded rng context out of a 16-bytes commit */
-RNG_CTX* sdith_rng_create_commit_rng_ctx(void const* const seed);
-
-void sdith_set_true_random_tape(uint8_t* in, size_t len);
-
 void serialize_compressed_pk(FILE* F, sdith_compressed_pubkey_t const* pk);
 void deserialize_pk(FILE* F, sdith_compressed_pubkey_t* pk);
 void serialize_sk(FILE* F, sdith_compressed_key_t const* sk);
 void deserialize_sk(FILE* F, sdith_compressed_key_t* sk);
 
+void field_init();
 void keygen(sdith_compressed_pubkey_t* pk, sdith_compressed_key_t* sk);
 void uncompress_key(sdith_compressed_pubkey_t const* pk, sdith_compressed_key_t const* sk, sdith_full_pubkey_t* u_pk,
                     sdith_full_key_t* u_sk);
